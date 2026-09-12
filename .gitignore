@@ -1,0 +1,11 @@
+node_modules/
+lib/
+novel/.novel/
+.dsh-home/
+.spike-chrome/
+# The isolated dev instance's novel root (README's 启动 section). It is a scratch
+# book with a deliberately broken fixture in it, not part of the product.
+.spike-novel/
+# The P5 benchmark's synthetic million-word book (spike/perf-check.mjs). Rebuilt
+# on every run; megabytes of generated prose, never part of the product.
+.spike-novel-perf/

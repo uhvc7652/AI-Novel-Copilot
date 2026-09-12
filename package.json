@@ -1,0 +1,52 @@
+{
+  "name": "dsh-ai-novel-copilot",
+  "description": "AI-Novel-Copilot: a DSH web plugin that turns DeepSeek Harness into a workspace for long-form Chinese web fiction",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "watch": "tsdown --watch",
+    "check:format": "node --experimental-transform-types spike/format-check.mjs",
+    "check:client": "node spike/client-load-check.mjs",
+    "check": "pnpm run typecheck && pnpm run build && pnpm run check:format && pnpm run check:client"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.20.2",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "^18.3.7",
+    "react": "^18.2.0",
+    "react-dom": "^18.3.1",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "js-yaml": "^5.4.1"
+  }
+}

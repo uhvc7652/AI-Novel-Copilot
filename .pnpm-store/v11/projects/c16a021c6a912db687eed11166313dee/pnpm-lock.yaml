@@ -1,0 +1,22 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: false
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      dsh-ai-novel-copilot:
+        specifier: file:E:/GameProject/AI-Novel-Copilot
+        version: file:../../..
+
+packages:
+
+  dsh-ai-novel-copilot@file:../../..:
+    resolution: {directory: ../../.., type: directory}
+
+snapshots:
+
+  dsh-ai-novel-copilot@file:../../..: {}

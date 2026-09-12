@@ -1,0 +1,17 @@
+{
+  "name": "dsh-profile-novel",
+  "private": true,
+  "dependencies": {
+    "dsh-ai-novel-copilot": "file:E:/GameProject/AI-Novel-Copilot"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-ai-novel-copilot"
+      ],
+      "patchReload": "live"
+    }
+  }
+}
