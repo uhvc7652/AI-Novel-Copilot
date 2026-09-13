@@ -25,6 +25,16 @@ export const OUTLINE_DIR = 'outline'
 /** Directory holding the voice guide and the style samples. */
 export const STYLE_DIR = 'style'
 
+/**
+ * Directory holding exported manuscripts (format §1: derived, not in git).
+ *
+ * It is deliberately **not** part of {@link isDocumentPath}: an export is a
+ * product, not an editable document, so it has no editor surface and no entry in
+ * the modification record. Re-running an export writes a new file (the name
+ * carries a timestamp) rather than replacing one the author may still be reading.
+ */
+export const EXPORTS_DIR = 'exports'
+
 /** Zero-padded volume directory name for a volume number. */
 export function volumeDir(volume: number): string {
   return `v${String(volume).padStart(2, '0')}`
@@ -42,6 +52,7 @@ export const CARD_DIRS = {
   location: 'locations',
   item: 'items',
   faction: 'factions',
+  lore: 'lore',
   thread: 'threads',
 } as const
 
@@ -51,12 +62,21 @@ export type CardType = keyof typeof CARD_DIRS
 /** Every card type, in display order. */
 export const CARD_TYPES = Object.keys(CARD_DIRS) as CardType[]
 
-/** Human-readable label for a card type, for the panel's group headings. */
+/**
+ * Human-readable label for a card type, for the panel's group headings.
+ *
+ * 「设定」 is the generic one (`lore`): whatever is true of the book but is not a
+ * person, a place, a thing or a faction — a cultivation ladder, a magic system,
+ * a term, a rule of the world. It exists so that material like 「每个流派的境界
+ * 阶梯」 has somewhere to live that is neither the world overview (which the
+ * model check reads whole) nor a card type it does not fit.
+ */
 export const CARD_LABELS: Record<CardType, string> = {
   character: '角色',
   location: '地点',
   item: '物品',
   faction: '势力',
+  lore: '设定',
   thread: '伏笔',
 }
 

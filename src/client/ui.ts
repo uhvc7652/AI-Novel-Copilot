@@ -142,6 +142,38 @@ export const THREAD_STATUS_LABEL: Record<string, string> = {
 }
 
 /**
+ * The thread cards the panel's 伏笔 tab lists.
+ *
+ * Re-exported from `novel/cards.ts` rather than defined here: the host's checks
+ * and retrieval ask the same question (`isRetiredCard`), and two answers to "is
+ * this card still in the book" is how the panel came to show a deleted 伏笔 while
+ * the author had already moved on to writing a new one under the same name.
+ */
+export { liveThreads } from '../novel/cards.ts'
+
+/** One surface of the panel. */
+export type PanelSection = 'prose' | 'threads' | 'settings' | 'outline' | 'search' | 'checks' | 'history' | 'export'
+
+/**
+ * The panel's surfaces, in the order its tab row shows them.
+ *
+ * The order is load-bearing, not cosmetic: `shortcuts.ts` numbers them
+ * (`Ctrl+Alt+1`…), so inserting a surface in the middle moves a key binding.
+ * Keeping the list here — beside the labels — is what makes that one edit
+ * instead of two that can disagree.
+ */
+export const PANEL_SECTIONS: readonly { id: PanelSection, label: string }[] = [
+  { id: 'prose', label: '正文' },
+  { id: 'threads', label: '伏笔' },
+  { id: 'settings', label: '设定' },
+  { id: 'outline', label: '大纲' },
+  { id: 'search', label: '检索' },
+  { id: 'checks', label: '检查' },
+  { id: 'history', label: '修改记录' },
+  { id: 'export', label: '导出' },
+]
+
+/**
  * What every view needs from the panel that hosts it.
  *
  * The note line and the busy flag live in one place on purpose: two views each
@@ -155,8 +187,23 @@ export interface PanelEnv {
   root: string
   /** Whether an operation is in flight. */
   busy: boolean
-  /** Run one operation with the shared busy/error surface. */
-  run(label: string, operation: () => Promise<string>): Promise<void>
+  /**
+   * Run one operation with the shared busy/error surface.
+   * @param label - what the operation is, for the failure line and the retry button.
+   * @param operation - the work; its return value becomes the status line.
+   * @param redo - how to redo it from current state, when re-running `operation`
+   *   would use state captured before the failure. Omit when the call is the
+   *   same thing either way.
+   */
+  run(label: string, operation: () => Promise<string>, redo?: () => void): Promise<void>
   /** Replace the status line without running anything. */
   note(text: string): void
+  /**
+   * Report a failure without throwing.
+   *
+   * The same status line as {@link note}, in the tone that says this went wrong:
+   * a view that catches its own error must not report it as an ordinary remark.
+   * @param text - what failed, in the author's language.
+   */
+  error(text: string): void
 }

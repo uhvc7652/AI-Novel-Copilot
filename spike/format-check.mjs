@@ -38,6 +38,24 @@ import { runChecks, checkProject } from '../src/novel/checks.ts'
 import { actionOf, diffCounts, diffLines, diffRows, parseHistoryEntry, splitLines } from '../src/novel/history.ts'
 import { historyDirOf, historyStamp, compareHistoryFiles, freeHistoryStamp, nextThreadId, chapterIdOfPath } from '../src/novel/paths.ts'
 import { parseIssues } from '../src/client/issues.ts'
+import { moveTimelineRow, parseTimeline, renderTimeline } from '../src/novel/timeline.ts'
+import { cardFacts } from '../src/client/tasks.ts'
+import { chineseNumber, exportFileName, renderExport, safeStem, stripChapterNumber } from '../src/novel/book-export.ts'
+import { findQuote as findQuoteHost, lineNumberOf } from '../src/novel/quote.ts'
+import { actionFor, shortcutHelp, shortcutLabel, KEY_BINDINGS } from '../src/client/shortcuts.ts'
+import { PANEL_SECTIONS, liveThreads } from '../src/client/ui.ts'
+import { CARD_FIELDS, CARD_SECTIONS, cardBodyHint, cardHasField, isRetiredCard, liveCards, roleLabels, roleValue, splitListText } from '../src/novel/cards.ts'
+import {
+  askText,
+  askYesNo,
+  cleanRootArg,
+  isArchivedData,
+  parseFlags,
+  restoredName,
+  suffixedName,
+  suffixProblem,
+} from '../tools/archived-lib.mjs'
+import { resolveEntities } from '../src/novel/search.ts'
 
 let failed = 0
 let passed = 0
@@ -118,6 +136,8 @@ const card = summarizeCard('settings/characters/chen-mo.md', [
   'name: 陈默',
   'aliases: [默哥, 陈小子]',
   'role: 主角',
+  'age: 19',
+  'gender: 男',
   'tags: [剑修]',
   'firstAppear: c0001',
   '---',
@@ -208,6 +228,7 @@ const searchChapter = (number, title, extra) => ({
   beats: [],
   characters: [],
   locations: [],
+  refs: [],
   body: '',
   ...extra,
 })
@@ -240,6 +261,7 @@ const CORPUS = [
     beats: [],
     characters: [],
     locations: [],
+    refs: [],
     firstAppear: 'c0001',
     body: '## 外貌\n十九岁，瘦。\n',
   },
@@ -258,6 +280,7 @@ const CORPUS = [
     beats: ['c0001'],
     characters: [],
     locations: [],
+    refs: [],
     thread: { status: 'planted', plantedIn: 'c0001', reinforcedIn: [], payoffIn: [], plannedPayoff: '第一卷末' },
     body: '## 埋点方式\n雨夜。\n',
   },
@@ -274,6 +297,7 @@ const CORPUS = [
     beats: [],
     characters: [],
     locations: [],
+    refs: [],
     body: '青石镇是灵气复苏的源头，青铜镜出自旧朝。\n',
   },
 ]
@@ -346,6 +370,13 @@ check('命中统计与扫描数如实报告',
 check('已存档的章仍可被检索到，但带着存档标记',
   searchDocs(CORPUS.map(doc => doc.kind === 'chapter' && doc.id === 'c0002' ? { ...doc, archived: true } : doc), '巡夜人')
     .hits.some(hit => hit.path === 'chapters/v01/c0002.md' && hit.archived))
+check('答案落在已存档的章上时，明说那一章被撤出了（不把撤出的章说成书里的位置）',
+  (() => {
+    // c0003 is where 陈默 last appears; archive it and the answer must say so.
+    const withArchived = CORPUS.map(doc => doc.id === 'c0003' ? { ...doc, archived: true } : doc)
+    const text = searchDocs(withArchived, '陈默上次出场在哪').answer?.text ?? ''
+    return text.includes('已经存档') && text.includes('撤出')
+  })())
 
 console.log('\n--- 一致性检查（M6：确定性规则） ---')
 
@@ -359,8 +390,12 @@ const checkChapter = (fileId, number, extra = {}) => ({
   status: 'draft',
   characters: [],
   locations: [],
+  refs: [],
   wordCount: 0,
   archived: false,
+  // Prose is part of the corpus now: M6's `thread-quote` has to look for a
+  // recorded sentence in the chapter it was recorded from.
+  body: '',
   ...extra,
 })
 /** One card of the check fixture. */
@@ -386,14 +421,26 @@ const CHECK_CORPUS = {
     checkChapter('c0001', 1, {
       pov: 'chen-mo', characters: ['chen-mo'], locations: ['qingshi-town'],
       targetWords: 3000, wordCount: 1200,
+      body: '雨下了一整夜。\n\n他握紧了那半块青铜镜，指节发白。\n',
     }),
-    checkChapter('c0002', 2, { archived: true, title: '撤掉的一章' }),
+    checkChapter('c0002', 2, { archived: true, title: '撤掉的一章', locations: ['old-towner'] }),
     // pov not listed in characters.
-    checkChapter('c0003', 3, { pov: 'lao-zhou', characters: ['chen-mo'], locations: ['old-town'] }),
+    checkChapter('c0003', 3, {
+      pov: 'lao-zhou', characters: ['chen-mo', 'lao-zhou-2'], locations: ['old-town'],
+      body: '巡夜人敲了下一家的门。\n',
+    }),
     // declares another id, and leaves a hole at 4 by numbering 5.
-    checkChapter('c0004', 5, { declaredId: 'c0009' }),
+    checkChapter('c0004', 5, { declaredId: 'c0009', locations: ['old-towner'] }),
     // a third chapter 3 → duplicate number.
     checkChapter('c0005', 3),
+    // ── 存档章不参与「关于它自己」的规则（作者确认要改的那一半）──────────────
+    // 它故意毛病齐备：pov 没有卡、location 没有卡、字数严重不足、声明的 id 与文件名
+    // 不一致。前三条都属于「撤出的章不必再被念叨」，最后一条不属于（见下）。
+    checkChapter('c0006', 6, {
+      archived: true, title: '撤掉的另一章',
+      pov: 'ghost-pov', locations: ['nowhere'],
+      targetWords: 3000, wordCount: 1, declaredId: 'c0099',
+    }),
   ],
   cards: [
     checkCard('chen-mo', {
@@ -405,6 +452,9 @@ const CHECK_CORPUS = {
     // an alias that is another card's id.
     checkCard('ghost-2', { name: '幽灵', aliases: ['chen-mo'] }),
     checkCard('old-town', { type: 'location', name: '旧镇', archived: true }),
+    // Named by an archived chapter *and* by a live one: `firstAppear` must be
+    // judged against the live one, so this card is quiet (see the assertions).
+    checkCard('old-towner', { type: 'location', name: '旧镇二号', firstAppear: 'c0004' }),
     {
       path: 'settings/threads/fs-003.md', id: 'fs-003', type: 'thread', name: '青铜镜的来历',
       aliases: [], archived: false, relations: [],
@@ -424,6 +474,107 @@ const CHECK_CORPUS = {
       path: 'settings/threads/fs-006.md', id: 'fs-006', type: 'thread', name: '计划点写成散文',
       aliases: [], archived: false, relations: [],
       thread: { status: 'planted', plantedIn: 'c0001', reinforcedIn: [], payoffIn: [], plannedPayoff: '第一卷末' },
+    },
+    // ── 原句（`thread-quote`）：五条，只有两条该报 ──────────────────────────
+    {
+      // The sentence is still in c0001, verbatim: quiet.
+      path: 'settings/threads/fs-007.md', id: 'fs-007', type: 'thread', name: '原句还在',
+      aliases: [], archived: false, relations: [],
+      thread: {
+        status: 'planted', plantedIn: 'c0001', plantedQuote: '他握紧了那半块青铜镜',
+        reinforcedIn: [], payoffIn: [],
+      },
+    },
+    {
+      // The sentence was rewritten (no 「握紧」 in c0001 any more): report.
+      path: 'settings/threads/fs-008.md', id: 'fs-008', type: 'thread', name: '原句被改写了',
+      aliases: [], archived: false, relations: [],
+      thread: {
+        status: 'planted', plantedIn: 'c0001', plantedQuote: '他攥住了那半块青铜镜',
+        reinforcedIn: [], payoffIn: [],
+      },
+    },
+    {
+      // Punctuation differs from c0001's text (a comma sits between the clauses),
+      // and the panel's own finder tolerates that — so this one must be quiet too.
+      // A check that disagreed with the 「跳回埋点」 button would be worse than no
+      // check at all.
+      path: 'settings/threads/fs-009.md', id: 'fs-009', type: 'thread', name: '标点差异',
+      aliases: [], archived: false, relations: [],
+      thread: {
+        status: 'planted', plantedIn: 'c0001', plantedQuote: '他握紧了那半块青铜镜指节发白',
+        reinforcedIn: [], payoffIn: [],
+      },
+    },
+    {
+      // A collected thread quoting a sentence c0003 really has: quiet.
+      path: 'settings/threads/fs-010.md', id: 'fs-010', type: 'thread', name: '回收原句还在',
+      aliases: [], archived: false, relations: [],
+      thread: {
+        status: 'paid', plantedIn: 'c0001', payoffIn: ['c0003'], payoffQuote: '巡夜人敲了下一家的门',
+        reinforcedIn: [],
+      },
+    },
+    {
+      // Two payoff chapters, and the sentence is in neither: report once, naming
+      // both places it was looked for.
+      path: 'settings/threads/fs-011.md', id: 'fs-011', type: 'thread', name: '回收原句没了',
+      aliases: [], archived: false, relations: [],
+      thread: {
+        status: 'paid', plantedIn: 'c0001', payoffIn: ['c0003', 'c0005'], payoffQuote: '这句话哪个版本里都没有',
+        reinforcedIn: [],
+      },
+    },
+    {
+      // A quote field that was never filled in is not a missing sentence.
+      path: 'settings/threads/fs-012.md', id: 'fs-012', type: 'thread', name: '原句没填',
+      aliases: [], archived: false, relations: [],
+      thread: { status: 'planted', plantedIn: 'c0001', plantedQuote: '   ', reinforcedIn: [], payoffIn: [] },
+    },
+    // ── 已删除（存档）的卡：作者报的真 bug（`07` §1.6 第 5 条）──────────────
+    // 删掉一张伏笔、再写一张同名的，检查里冒出两条 `alias-clash`——规则看的是
+    // 「工程里所有卡」，而不是「作者还在用的那一组」。下面几张卡专门钉住这件事：
+    // 存档的卡不参与命名 / 生命周期 / 关系 / firstAppear 的判断，但它的 **id 仍然有效**
+    // （c0003 引用 lao-zhou-2 不该变成「引用不存在的卡」）。
+    checkCard('ghost-old', { name: '陈默', archived: true }),
+    checkCard('zombie', {
+      name: '僵尸卡', archived: true,
+      relations: [{ to: 'nobody', kind: '旧识' }],
+    }),
+    checkCard('lao-zhou-2', { name: '老周二', aliases: [], archived: true, firstAppear: 'c0001' }),
+    {
+      // Same name as the live fs-003, and its lifecycle is a mess on purpose:
+      // every one of those would be reported if archived cards counted.
+      path: 'settings/threads/fs-013.md', id: 'fs-013', type: 'thread', name: '青铜镜的来历',
+      aliases: [], archived: true, relations: [],
+      thread: { status: 'paid', plantedIn: 'c9999', reinforcedIn: [], payoffIn: [] },
+    },
+    {
+      path: 'settings/threads/fs-014.md', id: 'fs-014', type: 'thread', name: '删掉的线',
+      aliases: [], archived: true, relations: [],
+      thread: {
+        status: 'planted', plantedIn: 'c0001', plantedQuote: '他攥住了那半块青铜镜',
+        reinforcedIn: [], payoffIn: [],
+      },
+    },
+    // ── 放弃（`status: abandoned`）也算退休：作者报的第二个例子 ────────────────
+    // 他放弃了一条叫「test」的线，又写了一条同样叫「test」的——卡片没存档，
+    // 于是撞车照旧。放弃一条线 = 这条线不在书里了，它的名字应当重新可用。
+    {
+      path: 'settings/threads/fs-015.md', id: 'fs-015', type: 'thread', name: '陈默',
+      aliases: [], archived: false, relations: [],
+      thread: { status: 'abandoned', plantedIn: 'c9999', reinforcedIn: [], payoffIn: [] },
+    },
+    {
+      // ...but two *live* threads sharing a name are still a real collision.
+      path: 'settings/threads/fs-016.md', id: 'fs-016', type: 'thread', name: '重名的活线',
+      aliases: [], archived: false, relations: [],
+      thread: { status: 'planted', plantedIn: 'c0001', reinforcedIn: [], payoffIn: [] },
+    },
+    {
+      path: 'settings/threads/fs-017.md', id: 'fs-017', type: 'thread', name: '重名的活线',
+      aliases: [], archived: false, relations: [],
+      thread: { status: 'planted', plantedIn: 'c0001', reinforcedIn: [], payoffIn: [] },
     },
   ],
   pages: [{
@@ -459,7 +610,11 @@ check('引用不存在的卡：一条 issue，两处依据', (() => {
 check('设定卡的 relations 指向不存在的卡', has('card-ref', 'settings/characters/chen-mo.md', 'ghost'))
 check('伏笔指向不存在的章节', has('thread-ref', 'settings/threads/fs-005.md', 'c9999'))
 check('时间线指向不存在的章节', has('timeline-ref', 'settings/timeline.md', 'c9999'))
-check('名字/别名撞车：两张卡各报一条', findRule('alias-clash').filter(issue => issue.severity === 'error').length === 2)
+check('名字/别名撞车：共用别名「默哥」的两张卡各报一条', (() => {
+  const pair = findRule('alias-clash').filter(issue => issue.severity === 'error'
+    && (issue.path === 'settings/characters/chen-mo.md' || issue.path === 'settings/characters/lao-zhou.md'))
+  return pair.length === 2 && pair.every(issue => issue.title.includes('默哥'))
+})())
 check('别名与另一张卡的 id 撞车另算一条', findRule('alias-clash').some(issue =>
   issue.severity === 'warn' && issue.path === 'settings/characters/ghost-2.md'))
 check('章号重复（两个第 3 章）', has('chapter-number', 'chapters/v01/c0003.md', '两个第 3 章'))
@@ -473,6 +628,120 @@ check('时间线倒序', has('timeline-order', 'settings/timeline.md', '倒序')
 check('伏笔计划回收点已过仍未回收', findRule('thread-unpaid').some(issue => issue.severity === 'warn' && issue.path === 'settings/threads/fs-003.md'))
 check('伏笔写着已回收却没有回收章节', findRule('thread-unpaid').some(issue => issue.severity === 'error' && issue.path === 'settings/threads/fs-004.md'))
 check('计划回收点写成散文（第一卷末）不下结论', !findRule('thread-unpaid').some(issue => issue.path === 'settings/threads/fs-006.md'))
+check('原句还在正文里：不报', !findRule('thread-quote').some(issue => issue.path === 'settings/threads/fs-007.md'))
+check('原句被改写：报一条警告，两侧依据都在', (() => {
+  const found = findRule('thread-quote').filter(issue => issue.path === 'settings/threads/fs-008.md')
+  return found.length === 1 && found[0].severity === 'warn'
+    && found[0].key === 'thread-quote:settings/threads/fs-008.md:plantedQuote:c0001'
+    && found[0].evidence.length === 2
+    && found[0].evidence[0].includes('他攥住了那半块青铜镜')
+    && found[0].evidence[1].includes('chapters/v01/c0001.md')
+})())
+check('标点差异仍然算找得到（与面板的「跳回埋点」用同一个 finder）',
+  !findRule('thread-quote').some(issue => issue.path === 'settings/threads/fs-009.md'))
+check('回收原句在任一回收章里就算找得到', !findRule('thread-quote').some(issue => issue.path === 'settings/threads/fs-010.md'))
+check('回收原句哪里都没有：报一条，依据里列出找过的每一章', (() => {
+  const found = findRule('thread-quote').filter(issue => issue.path === 'settings/threads/fs-011.md')
+  return found.length === 1
+    && found[0].key === 'thread-quote:settings/threads/fs-011.md:payoffQuote:c0003,c0005'
+    && found[0].evidence[1].includes('c0003.md') && found[0].evidence[1].includes('c0005.md')
+})())
+check('原句字段没填（只有空白）：不当成「找不到」',
+  !findRule('thread-quote').some(issue => issue.path === 'settings/threads/fs-012.md'))
+check('原句规则只报这两条（不把找得到的也算上）', findRule('thread-quote').length === 2,
+  findRule('thread-quote').map(issue => issue.key).join(' '))
+
+// ── 作者报的 bug：删掉的伏笔不该继续出现在检查里 ────────────────────────────
+// 规则只对「作者还在用的一组」说话：存档的卡（格式 §4.6 的删除）不参与命名、
+// 生命周期、关系与 firstAppear 的判断。
+const archivedPaths = new Set([
+  'settings/characters/ghost-old.md',
+  'settings/characters/zombie.md',
+  'settings/characters/lao-zhou-2.md',
+  'settings/threads/fs-013.md',
+  'settings/threads/fs-014.md',
+])
+check('已删除（存档）的卡不参与名字/别名撞车（作者报的第一条）',
+  !findRule('alias-clash').some(issue => archivedPaths.has(issue.path))
+  && findRule('alias-clash').length === 5,
+  findRule('alias-clash').map(issue => issue.key).join(' '))
+check('已删除的卡不参与伏笔的引用/生命周期/原句三条规则',
+  ['thread-ref', 'thread-unpaid', 'thread-quote']
+    .every(rule => !findRule(rule).some(issue => archivedPaths.has(issue.path))))
+check('已删除的卡的关系指向不存在的卡也不报',
+  !findRule('card-ref').some(issue => archivedPaths.has(issue.path)))
+check('已删除的卡的 firstAppear 不一致也不报',
+  !findRule('firstappear-mismatch').some(issue => archivedPaths.has(issue.path)))
+// ...但「删掉」不等于「从世界上抹掉」：id 仍然有效，否则删一张卡会让每一章都变成
+// 悬空引用——那正是 `archived-ref`（提示）要说的另一种话。
+check('存档卡的 id 仍然算存在：引用它的章不会变成 dangling ref',
+  !findRule('missing-ref').some(issue => issue.key.includes('lao-zhou-2') || issue.key.includes('old-town')))
+check('而「还在引用已存档的卡」照旧提示', findRule('archived-ref').some(issue =>
+  issue.path === 'chapters/v01/c0003.md' && issue.key.includes('lao-zhou-2')))
+
+// ── 放弃（`status: abandoned`）也是退休 ─────────────────────────────────────
+// 作者报的第二个例子：卡片没有存档，只是「放弃」了，于是撞车照旧。放弃一条线 =
+// 这条线不在书里了，它的名字重新可用；两条**活**线的重名仍然是真撞车。
+check('放弃的伏笔不再占用名字（它的名字与一张活卡重名也不报）',
+  !findRule('alias-clash').some(issue => issue.path.endsWith('fs-015.md')))
+check('放弃的伏笔的其它规则也不再对它开火（引用指向不存在的章）',
+  !findRule('thread-ref').some(issue => issue.path.endsWith('fs-015.md')))
+check('两条活着的重名伏笔仍然各报一条（规则没有被关掉）',
+  ['fs-016', 'fs-017'].every(id => findRule('alias-clash').some(issue =>
+    issue.severity === 'error' && issue.path.endsWith(`${id}.md`))))
+
+// ── 存档章：作者确认要改的那一半（`07` §2.5）───────────────────────────────
+// c0006 是一张故意毛病齐备的存档章（pov 没卡、location 没卡、字数严重不足、
+// 声明的 id 与文件名不一致）。前三条属于「撤出的章不必再被念叨」；最后一条不属于
+// ——存档章的 id 仍然是有效的**引用目标**，声明错了会让活文档的引用落错地方。
+check('存档章不再被 missing-ref 念叨（它的 frontmatter 不是书稿的声明）',
+  !findRule('missing-ref').some(issue => issue.path.endsWith('c0006.md')))
+check('存档章不再被 pov-unlisted 念叨（pov 只决定任务装配，存档章不进任务）',
+  !findRule('pov-unlisted').some(issue => issue.path.endsWith('c0006.md')))
+check('存档章不再被 word-drift 念叨（它已经不在字数里了）',
+  !findRule('word-drift').some(issue => issue.path.endsWith('c0006.md')))
+check('但存档章的 id 声明错误照旧报（它仍是有效的引用目标）',
+  findRule('id-mismatch').some(issue => issue.path.endsWith('c0006.md') && issue.key.endsWith(':c0099')))
+check('存档章的章号仍然占位（缺号只报真正没人占的号）',
+  findRule('chapter-gap').length === 1 && findRule('chapter-gap')[0].key.endsWith(':v1:4'))
+check('firstAppear 只对活章比较：更早的登记发生在一张存档章上时不算不一致',
+  !findRule('firstappear-mismatch').some(issue => issue.path.endsWith('old-towner.md')))
+
+// 面板那半边的同一件事：伏笔页签读的是这个选择器，它也必须把「删掉的」挡掉——
+// 否则检查干净了、页签里那张卡还在，作者看到的是「面板没删掉它」。
+console.log('\n--- 哪些卡还在工作集里（host 与面板共用同一个判断） ---')
+const cardOf = (id, type, archived, extra = {}) => ({
+  path: `settings/${type === 'thread' ? 'threads' : 'characters'}/${id}.md`,
+  id, type, name: id, aliases: [], archived, appearsIn: [], tags: [], gist: '',
+  ...extra,
+})
+check('删除（存档）的卡不在工作集里',
+  isRetiredCard(cardOf('chen-mo-old', 'character', true))
+  && !isRetiredCard(cardOf('chen-mo', 'character', false)))
+check('放弃（abandoned）的伏笔卡也不在（作者报的第二个例子）',
+  isRetiredCard(cardOf('th-old', 'thread', false, { thread: { status: 'abandoned' } }))
+  && !isRetiredCard(cardOf('th-open', 'thread', false, { thread: { status: 'planted' } }))
+  && !isRetiredCard(cardOf('th-paid', 'thread', false, { thread: { status: 'paid' } })))
+check('「放弃」只对伏笔卡有意义：角色卡的状态与退休无关',
+  !isRetiredCard(cardOf('chen-mo', 'character', false, { thread: { status: 'abandoned' } })))
+check('伏笔页签列出哪些卡：活卡留下，存档与放弃的都挡掉',
+  liveThreads([
+    cardOf('th-001', 'thread', false, { thread: { status: 'planted' } }),
+    cardOf('th-002', 'thread', false, { thread: { status: 'abandoned' } }),
+    cardOf('th-003', 'thread', true, { thread: { status: 'planted' } }),
+    cardOf('chen-mo', 'character', false),
+  ]).map(card => card.id).join() === 'th-001')
+check('空的卡列表得出空的伏笔列表（页签的「还没有伏笔」分支据此走）',
+  liveThreads([]).length === 0)
+check('检索不把退休的卡当成实体（否则「放弃后名字可用」只在检查里成立）',
+  (() => {
+    const docs = [
+      { kind: 'card', path: 'settings/threads/th-001.md', id: 'th-001', title: 'test', label: '伏笔', archived: false, cardType: 'thread', name: 'test', aliases: [], tags: [], summary: '', beats: [], characters: [], locations: [], refs: [], thread: { status: 'abandoned', reinforcedIn: [], payoffIn: [] }, body: '' },
+      { kind: 'card', path: 'settings/threads/th-002.md', id: 'th-002', title: 'test', label: '伏笔', archived: false, cardType: 'thread', name: 'test', aliases: [], tags: [], summary: '', beats: [], characters: [], locations: [], refs: [], thread: { status: 'planted', reinforcedIn: [], payoffIn: [] }, body: '' },
+    ]
+    const found = resolveEntities(docs, 'test 是什么')
+    return found.length === 1 && found[0].id === 'th-002'
+  })())
 check('视角人物没登记在 characters 里', has('pov-unlisted', 'chapters/v01/c0003.md', '视角人物'))
 check('字数严重偏离目标', findRule('word-drift').length === 1 && findRule('word-drift')[0].severity === 'info')
 check('firstAppear 与最早的出场登记不一致', has('firstappear-mismatch', 'settings/characters/lao-zhou.md', '不一致'))
@@ -507,8 +776,8 @@ check('忽略项移出待处理列表，但仍留在报告里', (() => {
 })())
 check('对不上任何 issue 的忽略记录被标为 stale', checkReport.stale.join() === 'gone:this:key')
 check('报告如实报告扫描量与分类计数',
-  checkReport.scanned.chapters === 5
-  && checkReport.scanned.cards === 8
+  checkReport.scanned.chapters === 6
+  && checkReport.scanned.cards === 23
   && checkReport.scanned.pages === 1
   && checkReport.counts.error + checkReport.counts.warn + checkReport.counts.info === checkReport.issues.length)
 
@@ -523,7 +792,10 @@ const FILES = {
   'outline/volumes/v01.md': '# 第一卷\n\n## 卷目标\n陈默在青石镇立足。\n',
   'outline/book.md': '# 全书主线\n\n## 核心卖点\n青铜镜的秘密。\n',
   'settings/world.md': '# 世界观\n\n## 不可违背的设定（硬约束）\n青铜镜出自旧朝，认主之后不可转赠。\n',
-  'settings/characters/chen-mo.md': '---\nname: 陈默\n---\n\n## 性格\n沉默。\n',
+  'settings/characters/chen-mo.md': '---\nname: 陈默\nrole: 主角\nage: 19\ngender: 男\naliases: [默哥, 陈小子]\n---\n\n## 性格\n沉默。\n',
+  // The generic setting card a chapter references through `refs` — a cultivation
+  // ladder is exactly what used to have nowhere to live but the world overview.
+  'settings/lore/jian-xiu-jingjie.md': '---\nid: jian-xiu-jingjie\nname: 剑修境界\n---\n\n## 分级\n练气 → 筑基 → 剑心 → 无我。\n',
   'chapters/v01/c0001.md': chapterText,
 }
 const requested = []
@@ -554,6 +826,9 @@ globalThis.fetch = async (url) => {
     headers,
   })
 }
+/** The generic setting card the fixture chapter references through `refs`. */
+const loreSetting = summarizeCard('settings/lore/jian-xiu-jingjie.md',
+  '---\nid: jian-xiu-jingjie\nname: 剑修境界\n---\n\n## 分级\n练气 → 筑基 → 剑心 → 无我。\n', [])
 const ctx = {
   sessionId: 'spike-session',
   root: 'E:/spike-novel',
@@ -561,13 +836,13 @@ const ctx = {
   volumes: [{ dir: 'v01', volume: 1, chapters: [c1, c2] }],
   chapter: {
     path: 'chapters/v01/c0002.md',
-    data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'], characters: ['chen-mo'], pov: 'chen-mo' },
+    data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'], characters: ['chen-mo'], pov: 'chen-mo', refs: ['jian-xiu-jingjie'] },
     body: '他握紧青铜镜。',
     wordCount: 8,
     version: '',
   },
   volume: 1,
-  cards: [card, archived].filter(Boolean),
+  cards: [card, archived, loreSetting].filter(Boolean),
 }
 
 const whole = await assemble(CHAPTER_TASKS[0], ctx)
@@ -575,6 +850,14 @@ check('整章任务读到章纲', whole.prompt.includes('陈默撞见巡夜人')
 check('整章任务读到上一章摘要与结尾',
   whole.prompt.includes('陈默捡到青铜镜。') && whole.prompt.includes('雨下了一整夜。'))
 check('整章任务读到出场角色卡正文', whole.prompt.includes('沉默。') && whole.prompt.includes('## chen-mo'))
+// C1：卡片自己的字段也进 prompt（此前只有正文，role/age/gender/别名 一个都到不了模型）。
+check('整章任务带上卡片的字段（名字/别名/身份/年龄/性别）',
+  whole.prompt.includes('名字: 陈默｜别名: 默哥、陈小子｜身份: 主角｜年龄: 19｜性别: 男'))
+// 「开始某一章时可以直接引用」：本章 frontmatter 的 refs 里的设定卡，正文随这一章进 prompt。
+check('整章任务读本章 refs 引用的设定卡（境界阶梯随章进 prompt）',
+  whole.prompt.includes('## jian-xiu-jingjie') && whole.prompt.includes('练气 → 筑基 → 剑心 → 无我。'))
+check('引用的设定卡出现在输入清单里（作者看得见模型读了什么）',
+  whole.inputs.some(item => item.path === 'settings/lore/jian-xiu-jingjie.md'))
 check('整章任务的输入清单列出每个文件',
   whole.inputs.some(item => item.path === 'outline/volumes/v01.md')
   && whole.inputs.some(item => item.path === 'style/style-guide.md')
@@ -589,7 +872,24 @@ check('卷纲任务读到主线与本卷已写章节',
 const planTask = await assemble(OUTLINE_TASKS[2], ctx)
 check('拆章任务要求纯 JSON', planTask.prompt.includes('只输出一个 JSON 数组'))
 check('拆章任务带上可用设定 id', planTask.prompt.includes('chen-mo — 陈默') && !planTask.prompt.includes('lao-zhou — 老周'))
+check('可用设定 id 带面板的类型名（模型才知道该往 refs 里放什么）',
+  planTask.prompt.includes('设定: jian-xiu-jingjie — 剑修境界') && planTask.prompt.includes('角色: chen-mo — 陈默'))
+check('拆章任务的输出形状写明 refs（拆出来的新章能直接引用设定卡）',
+  planTask.prompt.includes('"refs":["设定id"]') && planTask.prompt.includes('characters/locations/refs 只能使用'))
 check('拆章任务避开已存档卡', !planTask.prompt.includes('老周'))
+
+// An abandoned thread is not story material either: the author dropped that line,
+// so a plan should not offer it to the model as an available 伏笔. Same predicate
+// as the checks and the panel (`novel/cards.ts`).
+const droppedThread = summarizeCard(
+  'settings/threads/th-009.md',
+  '---\ntitle: 放弃的线\nstatus: abandoned\n---\n\n',
+  [],
+)
+const ctxWithDropped = { ...ctx, cards: [...ctx.cards, droppedThread].filter(Boolean) }
+const planWithDropped = await assemble(OUTLINE_TASKS[2], ctxWithDropped)
+check('拆章任务也避开「放弃」的伏笔（放弃的线不是可用的故事材料）',
+  planWithDropped.prompt.includes('chen-mo — 陈默') && !planWithDropped.prompt.includes('放弃的线'))
 check('拆章任务是 plan 类型', planTask.kind === 'plan' && planTask.apply === 'chapter-plan')
 check('读取失败不抛异常（不存在的文件被跳过）', !requested.includes('settings/locations/qingshi-town.md'))
 
@@ -842,7 +1142,7 @@ rejected = ''
 try { await io.createCard(scope, 'character', 'chen-mo', '陈默') } catch (error) { rejected = error.code }
 check('重名卡被拒绝', rejected === 'novel/conflict')
 
-const second = await io.createChapter(scope, { volume: 1, title: '第二章', beats: ['要点'], characters: ['chen-mo'] })
+const second = await io.createChapter(scope, { volume: 1, title: '第二章', beats: ['要点'], characters: ['chen-mo'], refs: ['jian-xiu-jingjie'] })
 const third = await io.createChapter(scope, { volume: 1, title: '第三章' })
 check('建章自动编号且带上章纲',
   second.number === 2 && second.path === 'chapters/v01/c0002.md' && second.beats.join() === '要点'
@@ -858,6 +1158,16 @@ check('反向链接由章节派生', library.groups[0].cards[0].appearsIn.join()
 check('两个单文件页报告存在性',
   library.pages.find(page => page.path === 'settings/world.md')?.exists === true
   && library.pages.find(page => page.path === 'settings/timeline.md')?.exists === false)
+
+// 通用设定卡（`lore`）是加出来的第六种卡：建卡、分组、反向索引走的都是既有规则，
+// 而「先写章、后建卡」也得能对上——引用是单向的，反向由索引现算。
+await io.createCard(scope, 'lore', 'jian-xiu-jingjie', '剑修境界')
+const withLore = await io.library(scope)
+const loreGroup = withLore.groups.find(group => group.type === 'lore')
+check('新建的「设定」卡进列表并自带分组标签',
+  withLore.total === 2 && loreGroup?.label === '设定' && loreGroup.cards[0].path === 'settings/lore/jian-xiu-jingjie.md')
+check('章节 refs 里的引用反向接上（先写章后建卡也算得出来）',
+  loreGroup?.cards[0].appearsIn.join() === 'c0002')
 
 const listing = await io.listDirectory(scope, 'settings/characters')
 check('目录列举给出子路径', listing.exists && listing.entries.some(entry => entry.path === 'settings/characters/chen-mo.md'))
@@ -922,7 +1232,8 @@ check('卡片被检索到时带上存档标记（不信"文件还在就等于在
 console.log('\n--- 一致性检查（host 侧：走文件系统与忽略项落盘） ---')
 const hostReport = await io.check(scope)
 check('io.check 扫章节、卡与文档，只在真有问题的章上开火', (() => {
-  return hostReport.scanned.chapters === 5 && hostReport.scanned.cards === 1 && hostReport.scanned.pages === 4
+  // 2 张卡：存档的角色卡（c0005 还在引用它 → 一条 archived-ref），加上上面新建的「设定」卡。
+  return hostReport.scanned.chapters === 5 && hostReport.scanned.cards === 2 && hostReport.scanned.pages === 4
     && hostReport.issues.length === 1
     && hostReport.issues[0].key === 'archived-ref:chapters/v01/c0005.md:chen-mo'
     && hostReport.issues[0].evidence.length === 2
@@ -1545,6 +1856,473 @@ check('正常结束仍然是 onSettle，且增量按累积长度投递',
 const reportedRun = await driveRun([{ text: '', done: true, reason: 'error', error: '无法创建写作 agent：没有可用凭据' }])
 check('host 报了失败文本时用 host 的原话',
   reportedRun.join('|') === 'error:无法创建写作 agent：没有可用凭据', reportedRun.join('|'))
+
+// ---------------------------------------------------------------------------
+// P5: 导出。渲染是纯函数，所以「作者的稿子出门时长什么样」可以在没有磁盘的条件下钉住；
+// 写出去的那一步则对着内存 fs 双跑一遍。
+console.log('\n--- 原句查找（P5 之后）：host 与浏览器用的是同一份实现 ---')
+check('host 可以直接 import 纯模块，不必从 client 拖进 React',
+  typeof findQuoteHost === 'function' && findQuoteHost === findQuote,
+  String(findQuoteHost === findQuote))
+check('lineAt / lineNumberOf 是同一套坐标',
+  lineAt('第一行\n第二行\n', 4) === '第二行' && lineNumberOf('第一行\n第二行\n', 4) === 2)
+check('空引文返回 missing（「没记」和「记了但找不到」是两件事）',
+  findQuoteHost('正文', '') .kind === 'missing' && findQuoteHost('正文', '   ').kind === 'missing')
+
+console.log('\n--- 时间线表格（一份解析 + 一份渲染，检查与编辑器共用） ---')
+const TIMELINE_BODY = [
+  '# 时间线',
+  '',
+  '| 叙事序 | 故事时间 | 事件 | 章节 |',
+  '|---|---|---|---|',
+  '| 1 | 元启三年·春 | 陈默被逐出家族 | c0001 |',
+  '| 2 | 元启三年·夏 | 捡到青铜镜 | c0003、c0001 |',
+  '| 3 |  | 还在想 |  |',
+  '',
+  '（表后面作者写的话要留着。）',
+  '',
+].join('\n')
+const parsedTimeline = parseTimeline(TIMELINE_BODY)
+check('解析：表头与分隔行不算数据行，行号是文件里的真实行号',
+  parsedTimeline.found && parsedTimeline.rows.length === 3
+  && parsedTimeline.rows[0].lineNo === 5 && parsedTimeline.rows[0].time === '元启三年·春'
+  && parsedTimeline.rows[0].chapters.join() === 'c0001')
+check('解析：一格可以写多章，按出现顺序读出来',
+  parsedTimeline.rows[1].chapters.join() === 'c0003,c0001')
+check('解析：没有章节 id 的行照样读出来（编辑器要显示它，检查跳过它）',
+  parsedTimeline.rows[2].chapters.length === 0 && parsedTimeline.rows[2].event === '还在想')
+check('解析：没有表格的正文返回 found=false（检查据此不对时间线发表意见）',
+  parseTimeline('# 时间线\n\n还没有表。\n').found === false
+  && parseTimeline('').rows.length === 0)
+check('渲染：只换掉表格，表外的文字一字不动',
+  (() => {
+    const next = renderTimeline(TIMELINE_BODY, [{ time: '元启三年·秋', event: '出镇', chapters: ['c0002'] }])
+    return next.startsWith('# 时间线\n\n| 叙事序 | 故事时间 | 事件 | 章节 |')
+      && next.includes('| 1 | 元启三年·秋 | 出镇 | c0002 |')
+      && next.includes('（表后面作者写的话要留着。）')
+      && !next.includes('陈默被逐出家族')
+  })())
+check('渲染：叙事序按行号重排（↑↓ 就是改它），多章仍用、连接',
+  renderTimeline(TIMELINE_BODY, [
+    { time: 'A', event: '甲', chapters: ['c0002'] },
+    { time: 'B', event: '乙', chapters: ['c0001', 'c0003'] },
+  ]).includes('| 2 | B | 乙 | c0001、c0003 |'))
+check('渲染：正文里没有表就追加一张（表头 + 分隔行都在）',
+  (() => {
+    const next = renderTimeline('# 时间线\n', [{ time: '春', event: '开场', chapters: ['c0001'] }])
+    return next.includes('| 叙事序 | 故事时间 | 事件 | 章节 |')
+      && next.includes('|---|---|---|---|')
+      && next.includes('| 1 | 春 | 开场 | c0001 |')
+      && next.startsWith('# 时间线')
+  })())
+check('往返：解析→渲染→再解析，行列与内容一一对上',
+  (() => {
+    const rows = parseTimeline(TIMELINE_BODY).rows
+    const again = parseTimeline(renderTimeline(TIMELINE_BODY, rows)).rows
+    return again.length === rows.length
+      && again.every((row, index) => row.time === rows[index].time
+        && row.event === rows[index].event
+        && row.chapters.join() === rows[index].chapters.join())
+  })())
+check('单元格里的竖线被换成全角（否则会把表格拆坏）',
+  renderTimeline('', [{ time: 'a|b', event: 'c|d', chapters: [] }]).includes('| 1 | a｜b | c｜d |  |'))
+check('↑↓ 换行：边界不动，中间真的换',
+  moveTimelineRow(['a', 'b', 'c'], 0, -1).join() === 'a,b,c'
+  && moveTimelineRow(['a', 'b', 'c'], 2, 1).join() === 'a,b,c'
+  && moveTimelineRow(['a', 'b', 'c'], 1, -1).join() === 'b,a,c')
+
+console.log('\n--- 设定卡的字段（C1：性别、年龄、以及它们进 prompt） ---')
+const richCard = summarizeCard('settings/characters/chen-mo.md', [
+  '---',
+  'id: chen-mo',
+  'type: character',
+  'name: 陈默',
+  'aliases: [默哥]',
+  'role: 主角',
+  'age: 19',
+  'gender: 男',
+  'tags: [剑修]',
+  '---',
+  '',
+  '## 性格',
+  '沉默。',
+  '',
+].join('\n'), [])
+check('摘要读得出 age 与 gender（数字年龄也读得出来）',
+  richCard.age === '19' && richCard.gender === '男' && richCard.role === '主角')
+check('没写的字段保持缺失，不是空串',
+  summarizeCard('settings/characters/lao-zhou.md', '---\nname: 老周\n---\n\n', []).gender === undefined)
+check('cardFacts 只列填了的字段，用｜分隔',
+  cardFacts(richCard) === '名字: 陈默｜别名: 默哥｜身份: 主角｜年龄: 19｜性别: 男｜标签: 剑修')
+check('cardFacts 对空字段安静：只有 id 的卡什么都不说',
+  cardFacts({
+    path: 'settings/items/x.md', id: 'x', type: 'item', name: 'x', aliases: [],
+    status: '', archived: false, tags: [], appearsIn: [], gist: '',
+  }) === '')
+// 作者报的两条：标签里打不出逗号、身份只能有一个。
+check('逗号分隔的输入：中英文逗号都认，空白与空段丢掉',
+  splitListText('灵异, 悬疑').join() === '灵异,悬疑'
+  && splitListText('灵异，悬疑，').join() === '灵异,悬疑'
+  && splitListText('  ').length === 0)
+check('身份：读得进一个，也读得进一串（纯标量与列表都合法）',
+  roleLabels('主角').join() === '主角'
+  && roleLabels(['主角', '前朝皇子']).join() === '主角,前朝皇子'
+  && roleLabels([' 主角 ', '']).join() === '主角'
+  && roleLabels(undefined).length === 0 && roleLabels(42).length === 0)
+check('身份：一个写回标量（老文件一个字节都不动），多个才写列表',
+  roleValue(['主角']) === '主角'
+  && Array.isArray(roleValue(['主角', '前朝皇子']))
+  && roleValue(['主角', '前朝皇子']).join() === '主角,前朝皇子'
+  && roleValue([]) === '' && roleValue(['  ']) === '')
+check('摘要把多个身份连成一行（面板列表与 prompt 都用它）',
+  summarizeCard('settings/characters/chen-mo.md',
+    '---\nname: 陈默\nrole: [主角, 前朝皇子]\n---\n\n', [])?.role === '主角、前朝皇子'
+  && cardFacts(summarizeCard('settings/characters/chen-mo.md',
+    '---\nname: 陈默\nrole: [主角, 前朝皇子]\n---\n\n', [])).includes('身份: 主角、前朝皇子'))
+
+// 作者报的第三条：地点、物品的编辑界面和角色卡一模一样。面板与 `cardFacts` 此前
+// 都只问「这个字段填了没有」，从没问「这种卡有没有这个字段」——于是地点的年龄、
+// 物品的性别既能被写进文件，也能被发进 prompt。规则收在 `novel/cards.ts`。
+const cardFieldsOf = type => CARD_FIELDS[type].join()
+check('每种卡有自己的字段表：年龄与性别只属于角色，身份只给角色与势力',
+  cardFieldsOf('character') === 'role,age,gender'
+  && cardHasField('character', 'age') && cardHasField('faction', 'role')
+  && !cardHasField('faction', 'age')
+  && !cardHasField('location', 'role') && !cardHasField('location', 'age')
+  && !cardHasField('item', 'gender') && !cardHasField('thread', 'gender'),
+  Object.keys(CARD_FIELDS).map(type => `${type}=[${cardFieldsOf(type)}]`).join(' '))
+check('每种卡都有属于自己的正文分节（不是一律角色的那五行）',
+  Object.keys(CARD_FIELDS).every(type => CARD_SECTIONS[type].length > 0)
+  && CARD_SECTIONS.character.includes('外貌') && CARD_SECTIONS.location.includes('地理')
+  && CARD_SECTIONS.item.includes('来历') && CARD_SECTIONS.faction.includes('立场')
+  && CARD_SECTIONS.lore.includes('分级') && CARD_SECTIONS.thread.includes('埋点方式'))
+check('面板的占位提示就是脚手架的同一份分节（不会各说各话）',
+  cardBodyHint('lore') === '定义 / 分级 / 条件与代价 / 边界（不可违背的部分）'
+  && cardBodyHint('character') === '外貌 / 性格 / 能力/境界（含成长曲线） / 动机与弧光 / 不可违背的设定（硬约束）')
+check('地点卡上写了 age / gender / role 也不进 prompt（格式里它一个都没有）',
+  (() => {
+    const location = summarizeCard('settings/locations/qingshi-town.md',
+      '---\nid: qingshi-town\nname: 青石镇\nrole: 边镇\nage: 三百年\ngender: 无\ntags: [旧朝]\n---\n\n', [])
+    // 摘要照读（文件里写着的事实不该在面板里消失），出门时按类型筛掉。
+    return location.age === '三百年' && cardFacts(location) === '名字: 青石镇｜标签: 旧朝'
+  })())
+check('势力卡保留角色也用的那一个字段：身份即立场',
+  cardFacts(summarizeCard('settings/factions/tian-yan-zong.md',
+    '---\nid: tian-yan-zong\nname: 天衍宗\nrole: 正道魁首\nage: 千年\n---\n\n', []))
+  === '名字: 天衍宗｜身份: 正道魁首')
+
+// 作者问「不同流派的境界设定放哪」之后加的通用设定卡：一个流派一张，正文里写阶梯；
+// 章节用 frontmatter 的 `refs` 直接引用它，被引用的卡随那一章进 prompt。
+console.log('\n--- 通用设定卡（lore）与章节引用 `refs` ---')
+const loreCard = summarizeCard('settings/lore/jian-xiu-jingjie.md',
+  '---\nid: jian-xiu-jingjie\nname: 剑修境界\naliases: [剑道阶梯]\n---\n\n## 分级\n练气 → 筑基 → 剑心 → 无我。\n', [])
+check('lore 是卡：类型来自目录，没有专属 frontmatter 字段（通用的那一张表）',
+  loreCard?.type === 'lore' && cardFieldsOf('lore') === '' && CARD_SECTIONS.lore.includes('分级'))
+check('lore 卡的名字与别名照常读出来（检索靠它当实体回答）',
+  loreCard?.name === '剑修境界' && loreCard?.aliases.join() === '剑道阶梯')
+check('章节 frontmatter 的 refs 解析成卡片 id 列表，并且进反向索引',
+  (() => {
+    const refChapter = summarizeChapter('chapters/v01/c0007.md',
+      '---\nid: c0007\nvolume: 1\nnumber: 7\nrefs: [jian-xiu-jingjie]\n---\n\n正文。\n')
+    return refChapter.refs.join() === 'jian-xiu-jingjie'
+      && referenceIndex([refChapter]).get('jian-xiu-jingjie')?.join() === 'c0007'
+  })())
+check('refs 里写错的 id 会被 missing-ref 抓住（和 characters/locations 同一条规则）',
+  (() => {
+    const cards = [checkCard('jian-xiu-jingjie', { path: 'settings/lore/jian-xiu-jingjie.md', type: 'lore', name: '剑修境界' })]
+    const chapter = checkChapter('c0007', 7, { refs: ['jian-xiu-jingjie', 'mei-you-zhe-zhang-ka'] })
+    const report = checkProject({ chapters: [chapter], cards, pages: [] })
+    const found = report.issues.filter(issue => issue.rule === 'missing-ref')
+    return found.length === 1 && found[0].title.includes('refs')
+      && found[0].evidence.join().includes('mei-you-zhe-zhang-ka')
+  })())
+
+console.log('\n--- 退休文件的运维脚本（tools/，作者自己在终端里跑） ---')
+// 这两个脚本会删改文件，所以「什么算已存档」「后缀怎么加、怎么还原」不能靠人肉小心，
+// 得是能断言的纯规则（frontmatter 用的还是插件自己的解析器）。
+check('只有 archived: true（YAML 布尔）才算已存档',
+  isArchivedData({ archived: true })
+  && !isArchivedData({})
+  && !isArchivedData({ archived: 'true' })
+  && !isArchivedData({ archived: false }))
+check('后缀加在扩展名之后（名字里带 .md 的话仍然会被当成文档扫描）',
+  suffixedName('c0009.md', '.archived') === 'c0009.md.archived'
+  && suffixedName('c0009.md.archived', '.archived') === undefined)
+check('还原就是把后缀去掉；没有后缀、或整个名字就是后缀时不给东西',
+  restoredName('c0009.md.archived', '.archived') === 'c0009.md'
+  && restoredName('c0009.md', '.archived') === undefined
+  && restoredName('.archived', '.archived') === undefined)
+check('以 .md 结尾的后缀被拒绝（它达不到「插件看不见」这个目的）',
+  suffixProblem('.md') !== undefined && suffixProblem('.archived.md') !== undefined
+  && suffixProblem('.archived') === undefined && suffixProblem('') !== undefined)
+check('命令行：--apply 才动磁盘，--suffix 可换标记，--restore 认，没给目录就留给调用方去问',
+  (() => {
+    const plain = parseFlags(['E:/书'])
+    const applied = parseFlags(['E:/书', '--apply', '--suffix', '.old'])
+    let threw = false
+    try { parseFlags(['E:/书', '--suffix']) } catch { threw = true }
+    return plain.apply === false && plain.suffix === '.archived' && plain.root === 'E:/书'
+      && applied.apply === true && applied.suffix === '.old'
+      && parseFlags(['E:/书', '--restore']).restore === true
+      // 无参数 = 双击那条路：不报错，root 留空交给脚本去问（交互路径在 .cmd 里）。
+      && parseFlags([]).root === undefined
+      // ...但一个说不通的 --suffix 仍然当场报错。
+      && threw
+  })())
+// 粘来的路径会带引号、会把尾部空格带进来（.cmd 里的 set /p 不 trim）——第一次真跑
+// 就撞在这个尾随空格上，所以这一条写成断言。
+check('路径参数先清理：去空白、去成对引号',
+  cleanRootArg('  E:/书  ') === 'E:/书'
+  && cleanRootArg('"E:/我的 书"') === 'E:/我的 书'
+  && cleanRootArg("'E:/书'") === 'E:/书'
+  && cleanRootArg('E:/书"') === 'E:/书"'
+  && cleanRootArg(undefined) === '')
+// 删除/改名只在真终端里才问、才有第二次机会；管道与重定向一律停在预演——
+// 这样同一个文件既能双击用，也能放进脚本里跑而不会自己动手。
+check('非终端（管道/重定向）里「确认」永远是「否」，问值回落到兜底',
+  (await askYesNo('要真的删吗？')) === false
+  && (await askText('小说工程目录：', 'novel')) === 'novel')
+
+console.log('\n--- 导出（P5）：一本书变成一个文件 ---')
+const exportSource = {
+  title: '测试之书',
+  genre: '中文长篇网文',
+  chapters: [
+    { path: 'chapters/v01/c0001.md', volume: 1, number: 1, title: '楔子·雨夜', body: '\n雨下了一整夜。\n\n' },
+    { path: 'chapters/v01/c0002.md', volume: 1, number: 2, title: '', body: '天亮了。\n' },
+    { path: 'chapters/v02/c0003.md', volume: 2, number: 3, title: '入城', body: '他进了城。\n' },
+    { path: 'chapters/v01/c0009.md', volume: 1, number: 9, title: '存档章', body: '存档的正文不该出门。', archived: true },
+  ],
+}
+const exportAt = '2026-09-12T10:20:30.123Z'
+const bookMd = renderExport(exportSource, { format: 'md', scope: 'book', at: exportAt })
+check('md 全书：书名一级标题、一行概览、卷与章分层',
+  bookMd.text.startsWith('# 测试之书\n\n中文长篇网文 · 共 3 章')
+  && bookMd.text.includes('## 第 1 卷')
+  && bookMd.text.includes('### 第 1 章 楔子·雨夜'))
+check('存档的章不进导出（它是撤出故事，不是删掉文件）',
+  !bookMd.text.includes('存档的正文不该出门') && bookMd.chapters === 3)
+check('没有标题的章仍然有章号标题', bookMd.text.includes('### 第 2 章\n'))
+check('导出里没有 frontmatter、没有机器字段',
+  !bookMd.text.includes('---') && !bookMd.text.includes('wordCount'))
+check('正文两侧的空白被收掉，正文本身逐字保留',
+  bookMd.text.includes('### 第 1 章 楔子·雨夜\n\n雨下了一整夜。\n\n### 第 2 章')
+  && bookMd.text.endsWith('他进了城。\n'))
+check('文件名带书名、范围与时间戳（两次导出不会互相覆盖）',
+  bookMd.fileName === '测试之书-全书-2026-09-12T10-20-30-123Z.md', bookMd.fileName)
+
+// 预览只要开头：一本百万字的书和它的导出一样大，为了显示 1200 个字而把整本送回来，
+// 是这个功能唯一一处浪费。截断发生在渲染之后，所以统计与文件名说的仍是**整份**导出。
+const fullBytes = bookMd.bytes
+check('不给 head 时：完整文本，bytes 就是它的长度，truncated 为假',
+  bookMd.bytes === bookMd.text.length && bookMd.truncated === false)
+check('给了 head：文本只有开头那么多，但 stats 与文件名仍是整份导出的',
+  (() => {
+    const cut = renderExport(exportSource, { format: 'md', scope: 'book', at: exportAt, head: 40 })
+    return cut.text.length === 40
+      && cut.truncated === true
+      && cut.bytes === fullBytes
+      && cut.words === bookMd.words
+      && cut.chapters === bookMd.chapters
+      && cut.fileName === bookMd.fileName
+      && bookMd.text.startsWith(cut.text)
+  })())
+check('head 比全文还大：不算截断，也不多补内容',
+  (() => {
+    const big = renderExport(exportSource, { format: 'md', scope: 'book', at: exportAt, head: fullBytes + 5000 })
+    return big.text === bookMd.text && big.truncated === false && big.bytes === fullBytes
+  })())
+check('head 是个说不通的数（0 / 负数 / NaN）：当成没给，导出的还是全文',
+  [0, -5, Number.NaN].every(head => {
+    const plan = renderExport(exportSource, { format: 'md', scope: 'book', at: exportAt, head })
+    return plan.text === bookMd.text && plan.truncated === false
+  }))
+
+const bookTxt = renderExport(exportSource, { format: 'txt', scope: 'book', at: exportAt })
+check('txt 没有 Markdown 装饰，章标题是纯文本行',
+  !bookTxt.text.includes('#') && bookTxt.text.includes('第 1 章 楔子·雨夜'))
+check('txt 与 md 的正文逐字相同（同一份稿子的两种皮）',
+  bookMd.text.includes('他进了城。') && bookTxt.text.includes('他进了城。'))
+check('单卷导出：只含这一卷，且不再重复卷标题（它整份就是那一卷）',
+  (() => {
+    const volume = renderExport(exportSource, { format: 'md', scope: 'volume', volume: 1, at: exportAt })
+    return volume.chapters === 2 && !volume.text.includes('## 第 1 卷')
+      && volume.text.includes('第 1 章 楔子·雨夜') && !volume.text.includes('入城')
+  })())
+check('单章导出：只有那一章，也没有书名页',
+  (() => {
+    const one = renderExport(exportSource, { format: 'md', scope: 'chapter', path: 'chapters/v02/c0003.md', at: exportAt })
+    return one.chapters === 1 && !one.text.includes('# 测试之书') && one.text.includes('# 第 3 章 入城')
+  })())
+
+/** The message one render refuses with. */
+const exportRefusal = (source, request) => {
+  try {
+    renderExport(source, request)
+    return ''
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+check('导出不存在的章：明说不在书稿里，而不是导出一份空的',
+  exportRefusal(exportSource, { format: 'md', scope: 'chapter', path: 'chapters/v01/c9999.md' }).includes('不在书稿里'))
+check('导出无法导出的章（已存档）同样被拒绝',
+  exportRefusal(exportSource, { format: 'md', scope: 'chapter', path: 'chapters/v01/c0009.md' }).includes('不在书稿里'))
+check('空书导出被拒绝，且说清为什么',
+  exportRefusal({ title: '空书', chapters: [] }, { format: 'md', scope: 'book' }).includes('还没有正文'))
+check('空卷导出被拒绝',
+  exportRefusal(exportSource, { format: 'md', scope: 'volume', volume: 7 }).includes('没有可导出的正文'))
+check('书名里的非法字符变成横杠（不是删掉）',
+  safeStem('第1章:雨夜/前传') === '第1章-雨夜-前传', safeStem('第1章:雨夜/前传'))
+check('空书名有兜底，不会得到「-.md」', safeStem('   ') === '未命名小说')
+
+// Real instance finding: the scaffold's create form stores `第二章 巡夜人` as the
+// title, and the first real export printed `第 2 章 第二章 巡夜人`. Reading the
+// output caught it; no assertion had.
+check('章标题里已经写了「第二章」时，导出不再叠一层',
+  renderExport(
+    { title: '书', chapters: [{ path: 'chapters/v01/c0002.md', volume: 1, number: 2, title: '第二章 巡夜人', body: '正文。' }] },
+    { format: 'md', scope: 'chapter', path: 'chapters/v01/c0002.md', at: exportAt },
+  ).text.includes('# 第 2 章 巡夜人'))
+check('中文数字与阿拉伯数字的章号前缀都认得',
+  stripChapterNumber('第十二章 归乡', 12) === '归乡'
+  && stripChapterNumber('第12章 归乡', 12) === '归乡'
+  && stripChapterNumber('第 3 节 归乡', 3) === '归乡'
+  && chineseNumber('二十三') === 23
+  && chineseNumber('一百零三') === 103)
+check('前缀与章号对不上时一个字都不动（那是书里的事实，不是装饰）',
+  stripChapterNumber('第三章 归乡', 5) === '第三章 归乡'
+  && stripChapterNumber('第十个夏天', 10) === '第十个夏天')
+check('标题只有章号时，剩下的是干净的标题',
+  (() => {
+    const only = renderExport(
+      { title: '书', chapters: [{ path: 'chapters/v01/c0005.md', volume: 1, number: 5, title: '第五章', body: '正文。' }] },
+      { format: 'md', scope: 'chapter', path: 'chapters/v01/c0005.md', at: exportAt },
+    )
+    return only.text.includes('# 第 5 章\n') && !only.text.includes('第五章')
+  })())
+
+const exportFs = memoryFs()
+const exportIo = cacheIoOf(exportFs, 'export-book')
+const exportScope = { root: 'export-book', sessionId: 'export-session' }
+await exportIo.scaffold(exportScope, '导出之书')
+await exportIo.writeChapter(exportScope, 'chapters/v01/c0001.md',
+  { id: 'c0001', volume: 1, number: 1, title: '第一章' }, '正文一。\n')
+const ioPlan = await exportIo.exportBook(exportScope, { format: 'md', scope: 'book', at: exportAt })
+check('io 渲染的导出含刚写下的正文', ioPlan.text.includes('正文一。') && ioPlan.chapters >= 1)
+const savedExport = await exportIo.saveExport(exportScope, { format: 'txt', scope: 'book', at: exportAt })
+check('导出写进 exports/，内容与渲染一致',
+  savedExport.path.startsWith('exports/')
+  && (await exportIo.read(exportScope, savedExport.path)).includes('正文一。'))
+check('导出是产物不是文档：它不产生修改记录，也不在可编辑白名单里',
+  !isDocumentPath(savedExport.path)
+  && (await exportIo.list(exportScope, '.novel/history/exports')).length === 0)
+let exportIoCoded = ''
+try {
+  await exportIo.exportBook(exportScope, { format: 'md', scope: 'chapter', path: 'chapters/v01/c0009.md' })
+} catch (error) {
+  exportIoCoded = error.code
+}
+check('io 把「没东西可导出」翻译成 host 的 bad-request（面板照常显示一句话）',
+  exportIoCoded === 'novel/bad-request')
+
+// ---------------------------------------------------------------------------
+// P5: 修改记录写不进去时，保存仍然成立——但面板必须说出来（`11` §5 的欠账）。
+console.log('\n--- 半失败：文件存下了，撤销的那一版没写进去 ---')
+const denyHistoryFs = (() => {
+  const base = memoryFs()
+  return {
+    ...base,
+    async writeText(target, content) {
+      if (target.targetKey.includes('/.novel/history')) {
+        throw Object.assign(new Error('权限被拒绝'), { code: 'FS_PERMISSION_DENIED' })
+      }
+      return await base.writeText(target, content)
+    },
+  }
+})()
+const denyIo = cacheIoOf(denyHistoryFs, 'deny-book')
+const denyScope = { root: 'deny-book', sessionId: 'deny-session' }
+await denyIo.scaffold(denyScope, '警告之书')
+const deniedWrite = await denyIo.writeChapter(denyScope, 'chapters/v01/c0002.md',
+  { id: 'c0002', volume: 1, number: 2, title: '第二章' }, '正文照旧落盘。\n')
+check('保存本身成立（正文真的写下去了）',
+  (await denyIo.read(denyScope, 'chapters/v01/c0002.md')).includes('正文照旧落盘。'))
+check('同时带回一条警告，说清缺少的是哪一版',
+  deniedWrite.warning !== undefined
+  && deniedWrite.warning.includes('修改记录没写进去')
+  && deniedWrite.warning.includes('不能回滚'),
+  String(deniedWrite.warning))
+const cleanWrite = await cacheIo.writeChapter(cacheScope, 'chapters/v01/c0003.md',
+  { id: 'c0003', volume: 1, number: 3, title: '第三章' }, '一切正常。\n')
+check('写成功的一版没有警告（不能把「都正常」也说成有事）', cleanWrite.warning === undefined)
+
+// ---------------------------------------------------------------------------
+// P5: 快捷键。它是数据，所以「哪些键管用、哪些不管用」可以逐条钉住。
+console.log('\n--- 快捷键（P5）：修饰键必须完全匹配 ---')
+/** One keystroke, with only the modifiers given held. */
+const press = (key, mods = {}) => actionFor({
+  key,
+  ctrlKey: false,
+  altKey: false,
+  shiftKey: false,
+  metaKey: false,
+  ...mods,
+})
+check('Ctrl+S 是保存', press('s', { ctrlKey: true }) === 'save')
+check('按 Shift 得到的 S 也算（同一个物理键）', press('S', { ctrlKey: true }) === 'save')
+check('⌘ 与 Ctrl 等价（网页在 mac 上）', press('s', { metaKey: true }) === 'save')
+check('单按 s 什么都不做——正文里它只是一个字母', press('s') === undefined)
+check('Ctrl+Alt+1..8 与页签一一对应（顺序即 ui.ts 里那份列表）',
+  PANEL_SECTIONS.every((item, index) => press(String(index + 1), { ctrlKey: true, altKey: true }) === `section:${item.id}`),
+  PANEL_SECTIONS.map((item, index) => `${String(index + 1)}=${item.id}`).join(' '))
+check('多按一个修饰键就不匹配（Ctrl+Shift+S 不是保存）',
+  press('s', { ctrlKey: true, shiftKey: true }) === undefined)
+check('没有绑定过的键落空（Ctrl+Alt+9）', press('9', { ctrlKey: true, altKey: true }) === undefined)
+check('Alt+↑/↓ 翻章，方向键本身落空',
+  press('ArrowUp', { altKey: true }) === 'prev-chapter'
+  && press('ArrowDown', { altKey: true }) === 'next-chapter'
+  && press('ArrowDown') === undefined)
+check('Esc 取消，且只在没有修饰键时',
+  press('Escape') === 'cancel' && press('Escape', { ctrlKey: true }) === undefined)
+check('每个动作都能印出它的键（按钮提示与行为同源，不会各说各话）',
+  KEY_BINDINGS.every(binding => shortcutLabel(binding.action) === binding.keys)
+  && shortcutHelp().length === KEY_BINDINGS.length
+  && new Set(KEY_BINDINGS.map(binding => binding.keys)).size === KEY_BINDINGS.length)
+check('没有一个是「无修饰键的可打印字符」（否则它会在正文里吃掉一个按键）',
+  KEY_BINDINGS.every(binding => binding.ctrl === true || binding.alt === true || binding.key === 'Escape'))
+
+// ---------------------------------------------------------------------------
+// P5: 错误处理。两句话必须能被作者拿去做决定：连不上 host 时说什么、失败能不能重来。
+console.log('\n--- 错误处理（P5）：连不上 host 的那句话 ---')
+globalThis.fetch = async () => { throw new TypeError('Failed to fetch') }
+let offlineMessage = ''
+let offlineCode = ''
+try {
+  await api.search('s', '/x', '陈默')
+} catch (error) {
+  offlineMessage = error.message
+  offlineCode = error.name
+}
+check('没得到任何响应时，说清是「连不上 host」并指出该怎么办',
+  offlineMessage.includes('没能连上 DSH host')
+  && offlineMessage.includes('/api/novel/search')
+  && offlineMessage.includes('刷新页面')
+  && offlineMessage.includes('Failed to fetch'),
+  offlineMessage)
+check('这个失败带一个稳定的码，好让面板认出来（novel/offline）', offlineCode === 'novel/offline')
+
+// 失败行打哪个码是一条规则，不是一句模板：host 的两族码都要打出来，而 `FS_*`
+// 恰恰是「作者按文档去制造一个失败」时会撞上的那一个（把工程指到不可写的
+// 路径 → FS_PERMISSION_DENIED）。面板曾经只认 `novel/` 前缀，于是这一层
+// 拒绝永远不显示码——规则现在收在 api.ts 里，所以它能被钉在这里。
+check('失败行会带上 host 的稳定码：novel/* 与 FS_* 都打',
+  ['novel/outside-project', 'novel/denied', 'FS_PERMISSION_DENIED', 'FS_STALE_VERSION']
+    .every(name => api.errorCodeOf(Object.assign(new Error('被拒绝'), { name })) === name))
+check('不是稳定码的不打：普通 JS 错误名与「host 没给码」的兜底',
+  ['TypeError', 'Error', 'novel/unknown']
+    .every(name => api.errorCodeOf(Object.assign(new Error('x'), { name })) === undefined)
+  && api.errorCodeOf('不是 Error') === undefined)
 
 console.log(`\n${failed === 0 ? 'RESULT: PASS' : `RESULT: FAIL — ${String(failed)} 项不符`}（${String(passed)} 通过 / ${String(failed)} 失败）`)
 process.exit(failed === 0 ? 0 : 1)

@@ -33,6 +33,8 @@
     "watch": "tsdown --watch",
     "check:format": "node --experimental-transform-types spike/format-check.mjs",
     "check:client": "node spike/client-load-check.mjs",
+    "archived": "node --experimental-transform-types tools/archive-delete.mjs",
+    "archived:suffix": "node --experimental-transform-types tools/archive-suffix.mjs",
     "check": "pnpm run typecheck && pnpm run build && pnpm run check:format && pnpm run check:client"
   },
   "license": "MIT",

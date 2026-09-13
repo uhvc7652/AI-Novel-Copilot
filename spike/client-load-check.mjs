@@ -177,6 +177,7 @@ function checkSurfaces(face, react, render) {
     busy: false,
     run: async () => 'ok',
     note: () => {},
+    error: () => {},
   }
   const chapter = {
     path: 'chapters/v01/c0001.md',
@@ -317,7 +318,7 @@ function checkSurfaces(face, react, render) {
   }
 
   const surfaces = [
-    ['Panel', { sessionId: 'spike-session', pickDirectory: async () => null }, ['选择文件夹', '打开', '初始化', '正文', '伏笔', '设定', '大纲', '检索', '检查', '修改记录']],
+    ['Panel', { sessionId: 'spike-session', pickDirectory: async () => null }, ['选择文件夹', '打开', '初始化', '正文', '伏笔', '设定', '大纲', '检索', '检查', '修改记录', '导出', '快捷键']],
     ['SettingsView', { env, library, chapters: [chapter], active: true, onReload: async () => {}, onOpenChapter: () => {}, onOpenDocument: () => {} }, ['陈默', '新建卡', '世界观', '已存档 1 张']],
     ['OutlineView', { env, snapshot, cards: library.groups[0].cards, active: true, onOpenChapter: () => {}, onChanged: async () => {}, onOpenDocument: () => {} }, ['本卷卷纲', '续写卷纲', '按卷纲拆章', '楔子·雨夜', '要点 2']],
     [
@@ -369,22 +370,24 @@ function checkSurfaces(face, react, render) {
     [
       // The foreshadowing surface. An open thread must reach the pixels with both
       // of its ends: the sentence it was planted with (that is what the jump
-      // selects) and where it is planned to pay off.
+      // selects) and where it is planned to pay off. Deleted threads are **not**
+      // in this list; the count is what says where they went.
       'ThreadsView',
       {
         env,
         threads: library.groups.flatMap(group => group.cards).filter(card => card.type === 'thread'),
+        archived: 2,
         chapters: [chapter],
         onJump: () => {},
         onOpenCard: () => {},
         onReload: async () => {},
       },
-      ['未回收', '已回收', '半块青铜镜的来历', '他握紧了那半块青铜镜', '第一卷末', '放弃', '打开卡片', '埋点', '回收', '第 1 章'],
+      ['未回收', '已回收', '半块青铜镜的来历', '他握紧了那半块青铜镜', '第一卷末', '放弃', '打开卡片', '埋点', '回收', '第 1 章', '已删除 2 条', '已删除（存档）的伏笔不在这里'],
     ],
     [
       'ThreadsView',
-      { env, threads: [], chapters: [chapter], onJump: () => {}, onOpenCard: () => {}, onReload: async () => {} },
-      ['还没有伏笔', '记为伏笔'],
+      { env, threads: [], archived: 1, chapters: [chapter], onJump: () => {}, onOpenCard: () => {}, onReload: async () => {} },
+      ['还没有伏笔', '记为伏笔', '另有 1 条已删除的伏笔'],
     ],
     ['TaskBar', {
       env,
@@ -395,6 +398,64 @@ function checkSurfaces(face, react, render) {
       onDocument: () => {},
       onCreateChapters: () => {},
     }, ['按章纲写整章', '续写']],
+    [
+      // P5's export surface. What must reach the pixels is the *choice* — format,
+      // scope, the three ways out — plus the honesty about what gets exported:
+      // archived chapters stay home, and unsaved prose is not in the file.
+      'ExportView',
+      { env, snapshot },
+      ['Markdown（.md）', '纯文本（.txt）', '全书', '某一卷', '预览', '导出到 exports/', '下载', '还没有导出过', '只导出没存档的章'],
+    ],
+    [
+      // ...and with a chapter open and dirty, the surface has to warn that the
+      // composer holds more than the disk does — the one way this button can
+      // surprise an author.
+      'ExportView',
+      { env, snapshot, openChapter: { path: 'chapters/v01/c0001.md', title: '楔子·雨夜', number: 1, dirty: true } },
+      ['当前章', '导出不会带上它', '先保存（Ctrl+S）再导出'],
+    ],
+    [
+      // The timeline's own editor (B): a table, not a blob of Markdown. The rows
+      // it lists must be the parsed table's, the picker must offer the chapters
+      // that exist, and the escape hatch must be visible.
+      'TimelineEditor',
+      {
+        env,
+        body: [
+          '# 时间线',
+          '',
+          '| 叙事序 | 故事时间 | 事件 | 章节 |',
+          '|---|---|---|---|',
+          '| 1 | 元启三年·春 | 陈默被逐出家门 | c0001 |',
+          '',
+        ].join('\n'),
+        chapters: [chapter],
+        onChange: () => {},
+      },
+      ['叙事序按行号自动排', '元启三年·春', '陈默被逐出家门', 'c0001', '+ 加一行', '编辑原文', '删', '第 1 章 楔子·雨夜'],
+    ],
+    [
+      // A timeline file with no table yet: the editor says so rather than
+      // rendering nothing, and creating the first row builds the table.
+      'TimelineEditor',
+      { env, body: '# 时间线\n', chapters: [chapter], onChange: () => {} },
+      ['还没有行', '这一页还没有表格'],
+    ],
+    [
+      // The list field that does not eat commas (the author typed 「灵异,悬疑」 into
+      // a tag box and watched the comma vanish). A server render cannot type for
+      // us, so this asserts the part that can be seen — the stored labels are
+      // displayed with their separator — and the pure parsing is asserted in
+      // format-check.
+      'ListField',
+      { value: ['灵异', '悬疑'], onChange: () => {}, placeholder: '标签（逗号分隔）' },
+      ['value="灵异, 悬疑"', 'placeholder="标签（逗号分隔）"'],
+    ],
+    [
+      'ListField',
+      { value: [], onChange: () => {}, placeholder: '别名（逗号分隔）' },
+      ['value=""', '别名（逗号分隔）'],
+    ],
     [
       'ModelIssueList',
       {

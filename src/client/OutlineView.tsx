@@ -32,6 +32,7 @@ import {
   type PanelEnv,
 } from './ui.ts'
 import { useQuoteLocate } from './locate.ts'
+import { ListField } from './ListField.tsx'
 
 /** Props for the outline view. */
 export interface OutlineViewProps {
@@ -49,6 +50,12 @@ export interface OutlineViewProps {
   active: boolean
   /** Bumped by the panel when this editor should re-read the outline it has open. */
   refreshToken?: number
+  /**
+   * Bumped by the panel when `Ctrl+S` means this surface's document rather than
+   * the chapter. Which of the two editors it saves is decided by `which` — the
+   * one on screen — so the key saves what the author is looking at.
+   */
+  saveToken?: number
   /** Tell the panel which document this surface has open, so M7's record view follows it. */
   onOpenDocument?(path: string, surface: 'outline', dirty: boolean): void
   /** A passage to select in the outline editor, from a diff line. */
@@ -75,16 +82,19 @@ function field(data: Record<string, unknown>, key: string): string {
   return ''
 }
 
-/** Render a list field as a comma-separated string. */
-function listText(data: Record<string, unknown>, key: string): string {
+/**
+ * Read a list field as labels, tolerating a bare scalar.
+ *
+ * The parsing moved into `ListField` (which keeps the comma the author typed),
+ * so this only has to answer "what are the labels".
+ * @param data - frontmatter data.
+ * @param key - field name.
+ * @returns the labels.
+ */
+function listOf(data: Record<string, unknown>, key: string): string[] {
   const value = data[key]
-  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string').join(', ')
-  return typeof value === 'string' ? value : ''
-}
-
-/** Split a comma-separated field back into a list. */
-function toList(text: string): string[] {
-  return text.split(/[,，]/).map(entry => entry.trim()).filter(entry => entry !== '')
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  return typeof value === 'string' && value.trim() !== '' ? [value] : []
 }
 
 /** The beats of a chapter document, as a mutable list. */
@@ -98,7 +108,7 @@ function beatsOf(data: Record<string, unknown>): string[] {
  * The outline view.
  * @param props - environment, the tree, the cards, and the navigation hooks.
  */
-export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, active, refreshToken, onOpenDocument, locate }: OutlineViewProps) {
+export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, active, refreshToken, saveToken, onOpenDocument, locate }: OutlineViewProps) {
   const lastVolume = snapshot.volumes.at(-1)?.volume ?? 1
   const [which, setWhich] = useState<Which>('volume')
   const [volume, setVolume] = useState(lastVolume)
@@ -217,8 +227,9 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
     void env.run('保存大纲', async () => {
       const written = await api.writeDocument(env.sessionId, env.root, outline.path, outline.data, outline.body)
       setOutline({ ...outline, original: { data: { ...outline.data }, body: outline.body }, exists: true })
-      return `已保存 ${outline.path}（${written.operation === 'create' ? '新建' : '覆盖'}，${String(written.after.length)} 字节）`
-    })
+      const warning = written.warning === undefined ? '' : `｜注意：${written.warning}`
+      return `已保存 ${outline.path}（${written.operation === 'create' ? '新建' : '覆盖'}，${String(written.after.length)} 字节）${warning}`
+    }, () => { saveCurrentRef.current?.() })
   }, [env, outline])
 
   const onSaveChapter = useCallback(() => {
@@ -227,9 +238,48 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
       const written = await api.writeDocument(env.sessionId, env.root, chapter.path, chapter.data, chapter.body)
       setChapter({ ...chapter, original: { data: { ...chapter.data }, body: chapter.body }, exists: true })
       await onChanged()
-      return `已保存 ${chapter.path}（${String(written.after.length)} 字节）`
-    })
+      const warning = written.warning === undefined ? '' : `｜注意：${written.warning}`
+      return `已保存 ${chapter.path}（${String(written.after.length)} 字节）${warning}`
+    }, () => { saveCurrentRef.current?.() })
   }, [chapter, env, onChanged])
+
+  /**
+   * Save what is on screen.
+   *
+   * This surface holds two documents — the outline and one chapter's beats — and
+   * `which` is already the answer to "which one is the author looking at", so the
+   * key follows the same switch the editors do instead of guessing.
+   */
+  const saveCurrent = useCallback(() => {
+    if (which === 'chapter') {
+      if (chapter === undefined) {
+        env.note('大纲页里还没有打开章纲——先在下面点一章')
+        return
+      }
+      onSaveChapter()
+      return
+    }
+    if (outline === undefined) {
+      env.note('大纲页里还没有打开卷纲——先在左边选一卷')
+      return
+    }
+    onSaveOutline()
+  }, [chapter, env, onSaveChapter, onSaveOutline, outline, which])
+  /**
+   * ...and the current one as a ref, so a failed save's retry re-enters the
+   * newest dispatch rather than re-running the closure that failed with the
+   * buffer it held at that moment.
+   */
+  const saveCurrentRef = useRef<(() => void) | undefined>(undefined)
+  saveCurrentRef.current = saveCurrent
+
+  /** Save when the panel asks (`Ctrl+S` / the footer's 保存), once per request. */
+  const saveSeen = useRef(saveToken)
+  useEffect(() => {
+    if (saveToken === undefined || saveToken === saveSeen.current) return
+    saveSeen.current = saveToken
+    saveCurrent()
+  }, [saveCurrent, saveToken])
 
   /**
    * Edit one beat.
@@ -297,6 +347,7 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
           beats: plan.beats,
           characters: plan.characters,
           locations: plan.locations,
+          refs: plan.refs,
           ...(plan.summary === undefined ? {} : { summary: plan.summary }),
           ...(plan.targetWords === undefined ? {} : { targetWords: plan.targetWords }),
         })
@@ -464,17 +515,24 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
             />
           </div>
           <div style={row}>
-            <input
+            <ListField
               style={{ ...input, flex: '1 1 120px' }}
-              value={listText(chapter.data, 'characters')}
+              value={listOf(chapter.data, 'characters')}
               placeholder="出场角色 id（逗号分隔）"
-              onChange={event => { patchChapter({ characters: toList(event.target.value) }) }}
+              onChange={ids => { patchChapter({ characters: ids }) }}
             />
-            <input
+            <ListField
               style={{ ...input, flex: '1 1 120px' }}
-              value={listText(chapter.data, 'locations')}
+              value={listOf(chapter.data, 'locations')}
               placeholder="地点 id（逗号分隔）"
-              onChange={event => { patchChapter({ locations: toList(event.target.value) }) }}
+              onChange={ids => { patchChapter({ locations: ids }) }}
+            />
+            <ListField
+              style={{ ...input, flex: '1 1 120px' }}
+              value={listOf(chapter.data, 'refs')}
+              placeholder="引用的设定 id（逗号分隔）"
+              title="这一章要依据的世界设定卡（settings/lore/：境界阶梯、体系规则…）"
+              onChange={ids => { patchChapter({ refs: ids }) }}
             />
           </div>
           <input

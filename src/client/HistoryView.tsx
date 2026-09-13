@@ -89,6 +89,14 @@ export function HistoryView({ env, path, title, active, dirty, onRestored, onLoc
   const [selected, setSelected] = useState<string>()
   const [entry, setEntry] = useState<OpenedVersion>()
   const [expanded, setExpanded] = useState(false)
+  /**
+   * Why the list could not be read, when it could not.
+   *
+   * Without this the surface said "这个文件还没有被面板保存过" after a failed read —
+   * which is not a missing record, it is a broken question, and the two read
+   * identically to an author looking for a version they know exists.
+   */
+  const [loadError, setLoadError] = useState<string>()
 
   const load = useCallback(async () => {
     if (path === undefined) {
@@ -115,7 +123,11 @@ export function HistoryView({ env, path, title, active, dirty, onRestored, onLoc
    */
   useEffect(() => {
     if (!active) return
-    void load().catch(() => { setEntries([]) })
+    setLoadError(undefined)
+    void load().catch((error: unknown) => {
+      setEntries([])
+      setLoadError(error instanceof Error ? error.message : String(error))
+    })
   }, [active, load])
 
   useEffect(() => {
@@ -126,7 +138,14 @@ export function HistoryView({ env, path, title, active, dirty, onRestored, onLoc
     let live = true
     void api.readHistoryEntry(env.sessionId, env.root, path, selected)
       .then(found => { if (live) setEntry(found) })
-      .catch(() => { if (live) setEntry(undefined) })
+      .catch((error: unknown) => {
+        // The list is fine but this one version is not readable: say so rather
+        // than showing an empty diff pane, which reads as "no changes".
+        if (live) {
+          setEntry(undefined)
+          env.error(`读取这一版失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+      })
     return () => { live = false }
   }, [env.root, env.sessionId, path, selected])
 
@@ -184,7 +203,7 @@ export function HistoryView({ env, path, title, active, dirty, onRestored, onLoc
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minHeight: 0 }}>
       <div style={controlRow}>
         <span style={caption}>
-          {title} · {entries.length === 0 ? '还没有记录' : `${String(entries.length)} 版`}
+          {title} · {loadError !== undefined ? '读不出来' : entries.length === 0 ? '还没有记录' : `${String(entries.length)} 版`}
         </span>
         <span style={row}>
           <button type="button" style={button} disabled={env.busy || entries[1] === undefined}
@@ -200,7 +219,13 @@ export function HistoryView({ env, path, title, active, dirty, onRestored, onLoc
       </div>
 
       {entries.length === 0
-        ? <div style={metaLine}>这个文件还没有被面板保存过。保存一次之后，每一版都会留在这里。</div>
+        ? (
+          <div style={metaLine}>
+            {loadError === undefined
+              ? '这个文件还没有被面板保存过。保存一次之后，每一版都会留在这里。'
+              : `修改记录读不出来：${loadError}`}
+          </div>
+        )
         : (
           <div style={box}>
             {entries.map((item, index) => {

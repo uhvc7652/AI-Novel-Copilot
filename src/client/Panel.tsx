@@ -23,6 +23,7 @@ import type { ChapterStatus, ChapterSummary, ProjectSnapshot } from '../novel/pr
 import type { CheckIssue, CheckReport } from '../novel/checks.ts'
 import * as api from './api.ts'
 import { pointedText, useQuoteLocate } from './locate.ts'
+import { ExportView } from './ExportView.tsx'
 import { OutlineView } from './OutlineView.tsx'
 import {
   loadRecents,
@@ -31,6 +32,7 @@ import {
   saveRecents,
   type RecentProject,
 } from './projects.ts'
+import { actionFor, shortcutHelp, shortcutLabel } from './shortcuts.ts'
 import { SettingsView } from './SettingsView.tsx'
 import { ThreadsView } from './ThreadsView.tsx'
 import { SearchView } from './SearchView.tsx'
@@ -46,12 +48,15 @@ import {
   controlRow,
   input,
   listRow,
+  liveThreads,
   metaLine,
+  PANEL_SECTIONS,
   row,
   STATUS_LABEL,
   textarea,
   wrap,
   type PanelEnv,
+  type PanelSection,
 } from './ui.ts'
 
 /** Props the slot framework passes to a session-scoped tab body. */
@@ -75,18 +80,22 @@ interface OpenChapter {
 }
 
 /** Which surface the panel is showing. */
-type Section = 'prose' | 'settings' | 'outline' | 'search' | 'checks' | 'history' | 'threads'
+type Section = PanelSection
 
-/** Section tabs, in the order the panel shows them. */
-const SECTIONS: readonly { id: Section, label: string }[] = [
-  { id: 'prose', label: '正文' },
-  { id: 'threads', label: '伏笔' },
-  { id: 'settings', label: '设定' },
-  { id: 'outline', label: '大纲' },
-  { id: 'search', label: '检索' },
-  { id: 'checks', label: '检查' },
-  { id: 'history', label: '修改记录' },
-]
+/** Section tabs, in the order the panel shows them (see `ui.ts` — the order is numbered by `shortcuts.ts`). */
+const SECTIONS = PANEL_SECTIONS
+
+/** Where a failure message is coloured; dim grey text cannot say "this went wrong". */
+const ERROR_COLOR = '#d9534f'
+
+/** Which one the status line is carrying. */
+type NoteTone = 'info' | 'error'
+
+/** The status line's current content. */
+interface Note {
+  text: string
+  tone: NoteTone
+}
 
 /** Where the panel remembers the last project root. */
 const ROOT_STORAGE_KEY = 'dsh-ai-novel-copilot.root'
@@ -140,7 +149,36 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const [section, setSection] = useState<Section>('prose')
   const [open, setOpen] = useState<OpenChapter>()
   const [original, setOriginal] = useState<OpenChapter>()
-  const [note, setNote] = useState('未打开工程')
+  /**
+   * The one status line.
+   *
+   * It carries a tone rather than being a bare string because a failure and a
+   * success used to be indistinguishable: both were dim grey text, so "已保存"
+   * and "保存失败：…" looked the same at a glance and the author had to read
+   * every line to know whether the last action worked.
+   */
+  const [status, setStatus] = useState<Note>({ text: '未打开工程', tone: 'info' })
+  /**
+   * The last operation that failed, kept so it can be run again.
+   *
+   * A failed save is the moment re-doing the whole action by hand is most
+   * annoying, and the operation is a closure the panel already holds. Cleared by
+   * any success, so the button never offers to redo something unrelated.
+   *
+   * `redo` exists because a retry must not re-run a *stale* operation: the save
+   * closure captures the buffer as it was when the failure happened, so retrying
+   * after another paragraph would write the older draft. A caller that writes
+   * editor state passes a redo which re-derives it from the current render
+   * instead; everything else (a fetch, a scan, a rollback to a named version)
+   * is the same call either way.
+   */
+  const [retry, setRetry] = useState<{
+    label: string
+    operation: () => Promise<string>
+    redo?: () => void
+  }>()
+  /** Whether the shortcut cheat-sheet is open. */
+  const [showKeys, setShowKeys] = useState(false)
   const [busy, setBusy] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
   /** Projects the author has opened before, newest first. */
@@ -174,6 +212,17 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const [outlineLocate, setOutlineLocate] = useState<{ quote: string, token: number }>()
   /** Bumped when the other editors should re-read whatever they have open. */
   const [refreshToken, setRefreshToken] = useState(0)
+  /**
+   * Bumped to ask a sibling surface to save what it has open.
+   *
+   * `Ctrl+S` means "save the document I am looking at", and that document may be
+   * a card or an outline rather than the chapter — the panel knows *which*
+   * surface owns it (`activeDoc`) but not *how* that surface writes it. A token
+   * is how the request crosses that seam without lifting three editors' save
+   * logic into one place: same shape as `refreshToken`, and for the same reason.
+   */
+  const [settingsSaveToken, setSettingsSaveToken] = useState(0)
+  const [outlineSaveToken, setOutlineSaveToken] = useState(0)
   /** The name being typed for a foreshadowing about to be recorded at the cursor. */
   const [threadDraft, setThreadDraft] = useState('')
   /** Whether the 「记为伏笔」 form is open. */
@@ -202,6 +251,15 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const recentsRef = useRef<RecentProject[]>([])
   /** Guards against writing the same chapter twice at once. */
   const saveRef = useRef(false)
+  /**
+   * The current "save whatever is open" action.
+   *
+   * Declared as a ref because `onSave` (which needs it as the redo for a failed
+   * save) is defined *before* `saveActive`, and the two cannot depend on each
+   * other through `useCallback` deps without a cycle. The ref is filled during
+   * render, so by the time a button can be clicked it holds the current one.
+   */
+  const saveActiveRef = useRef<(() => void) | undefined>(undefined)
   /** Whether this mount has already restored the last project. */
   const restoredRef = useRef(false)
   /**
@@ -234,17 +292,77 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
       || field(open.data, 'status') !== field(original.data, 'status')
       || field(open.data, 'targetWords') !== field(original.data, 'targetWords'))
 
-  /** Run one operation with a shared busy/error surface. */
-  const run = useCallback(async (label: string, operation: () => Promise<string>) => {
+  /**
+   * Whether the document on screen differs from the file.
+   *
+   * The panel holds three editable documents and each knows its own dirty state;
+   * the footer's 保存 button and `Ctrl+S` both act on "the one the author is
+   * looking at", which is `activeDoc` (see M7) rather than the visible tab.
+   */
+  const activeDirty = activeDoc === undefined
+    ? false
+    : activeDoc.surface === 'prose' ? dirty : activeDoc.dirty === true
+
+  /**
+   * Warn before the page goes away with unsaved text in it.
+   *
+   * A browser will not show a custom message any more, only its own "leave
+   * site?" prompt, and that is still the difference between a lost paragraph and
+   * a decision. Switching chapters and cards already asks; closing the tab, the
+   * window, or reloading after a rebuild did not ask anything.
+   */
+  useEffect(() => {
+    if (!activeDirty) return
+    const warn = (event: BeforeUnloadEvent): void => {
+      event.preventDefault()
+      // Older engines read `returnValue`; the standard reads `preventDefault`.
+      event.returnValue = ''
+    }
+    globalThis.addEventListener('beforeunload', warn)
+    return () => { globalThis.removeEventListener('beforeunload', warn) }
+  }, [activeDirty])
+
+  /** Put a message on the status line. */
+  const say = useCallback((text: string, tone: NoteTone = 'info') => {
+    setStatus({ text, tone })
+  }, [])
+
+  /**
+   * Run one operation with a shared busy/error surface.
+   *
+   * Every host call in the panel goes through here, which is what makes the error
+   * handling uniform: a failure is coloured, says which action failed, keeps a
+   * retry in hand, and names the host's error code, no matter which button
+   * produced it.
+   * @param label - what the operation is, for the failure line and the retry button.
+   * @param operation - the work; its return value becomes the status line.
+   * @param redo - how to redo it from current state, when re-running the closure
+   *   would use state that has moved on since it was captured.
+   */
+  const run = useCallback(async (
+    label: string,
+    operation: () => Promise<string>,
+    redo?: () => void,
+  ) => {
     setBusy(true)
     try {
-      setNote(await operation())
+      say(await operation())
+      setRetry(undefined)
     } catch (error) {
-      setNote(`${label}失败：${error instanceof Error ? error.message : String(error)}`)
+      const message = error instanceof Error ? error.message : String(error)
+      // The host's stable code is worth printing: `novel/outside-project` and
+      // `FS_STALE_VERSION` say which layer refused and which rule was hit, which
+      // a Chinese sentence alone cannot, and the author is often the person who
+      // will read the host's log next. Which codes qualify is `api`'s rule
+      // rather than this line's: an `FS_*` refusal is precisely the case a
+      // `novel/` prefix test here used to swallow.
+      const code = api.errorCodeOf(error)
+      say(`${label}失败${code === undefined ? '' : `（${code}）`}：${message}`, 'error')
+      setRetry(redo === undefined ? { label, operation } : { label, operation, redo })
     } finally {
       setBusy(false)
     }
-  }, [])
+  }, [say])
 
   const effectiveRoot = useCallback(async (): Promise<string> => {
     if (root.trim() !== '') return root.trim()
@@ -321,9 +439,9 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const projectRoot = useCallback((action: string): string | undefined => {
     const value = root.trim()
     if (value !== '') return value
-    setNote(`${action}前请先点「打开」或「初始化」——工程目录还是空的`)
+    say(`${action}前请先点「打开」或「初始化」——工程目录还是空的`)
     return undefined
-  }, [root])
+  }, [root, say])
 
   /** Everything the three surfaces need from the host. */
   const env: PanelEnv = useMemo(() => ({
@@ -331,8 +449,9 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     root: root.trim(),
     busy,
     run,
-    note: setNote,
-  }), [busy, root, run, sessionId])
+    note: say,
+    error: (text: string) => { say(text, 'error') },
+  }), [busy, root, run, say, sessionId])
 
   const onOpen = useCallback(() => {
     void run('打开工程', async () => await openRoot(await effectiveRoot()))
@@ -346,7 +465,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   /** Pick a folder with the shell's own chooser and open it. */
   const onPickFolder = useCallback(() => {
     if (pickDirectory === undefined) {
-      setNote('这个部署没有装目录选择器，请直接在上面填工程路径')
+      say('这个部署没有装目录选择器，请直接在上面填工程路径')
       return
     }
     void run('选择文件夹', async () => {
@@ -423,9 +542,22 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
 
   /** The chapter id the open chapter's references use, or empty when none is open. */
   const openChapterId = open === undefined ? '' : chapterIdOfPath(open.path) ?? ''
-  /** Every foreshadowing thread in the project. */
+  /** Every foreshadowing thread in the project — deleted (archived) ones excluded. */
   const threads = useMemo(
-    () => library?.groups.flatMap(group => group.cards).filter(card => card.type === 'thread') ?? [],
+    () => liveThreads(library?.groups.flatMap(group => group.cards) ?? []),
+    [library],
+  )
+  /**
+   * Threads the author deleted, which the 伏笔 tab no longer lists.
+   *
+   * Counted so the surface can say where they went: a card that disappears from
+   * the only list the author looks at, with no hint, reads as "the panel lost
+   * it". They are still in the settings library behind 「显示已存档」, and
+   * restoring one brings it back here — and back into the checks.
+   */
+  const archivedThreads = useMemo(
+    () => (library?.groups.flatMap(group => group.cards) ?? [])
+      .filter(card => card.type === 'thread' && card.archived).length,
     [library],
   )
   /** The threads that could be collected right now. */
@@ -450,11 +582,11 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     const target = projectRoot('记伏笔')
     if (target === undefined) return
     if (open === undefined) {
-      setNote('先在正文页打开一章，再记伏笔')
+      say('先在正文页打开一章，再记伏笔')
       return
     }
     if (name === '') {
-      setNote('给这条伏笔起个名字（写在伏笔卡的标题上）')
+      say('给这条伏笔起个名字（写在伏笔卡的标题上）')
       return
     }
     const quote = pointedText(bodyRef.current, open.body)
@@ -491,11 +623,11 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     if (target === undefined) return
     const thread = openThreads.find(candidate => candidate.id === collecting)
     if (thread === undefined) {
-      setNote('先在上面选一条要回收的伏笔')
+      say('先在上面选一条要回收的伏笔')
       return
     }
     if (open === undefined || openChapterId === '') {
-      setNote('先在正文页打开一章，回收会记在那一章上')
+      say('先在正文页打开一章，回收会记在那一章上')
       return
     }
     const quote = pointedText(bodyRef.current, open.body)
@@ -557,7 +689,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     setLocateRequest(request)
   }, [activeDoc])
 
-  useQuoteLocate(bodyRef, locateRequest, open?.body ?? '', setNote)
+  useQuoteLocate(bodyRef, locateRequest, open?.body ?? '', say)
 
   /**
    * Run the deterministic consistency checks.
@@ -639,12 +771,126 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
         setProvenance(undefined)
         await refresh(target)
         const delta = written.before === null ? '新建' : `${String(written.before.length)} → ${String(written.after.length)} 字节`
-        return `已保存 ${open.path}（${String(written.wordCount)} 字，${delta}）`
+        // A save whose undo entry did not get written is a half-failure, and the
+        // author is the only one who can decide whether to care.
+        const warning = written.warning === undefined ? '' : `｜注意：${written.warning}`
+        return `已保存 ${open.path}（${String(written.wordCount)} 字，${delta}）${warning}`
       } finally {
         saveRef.current = false
       }
-    })
+    }, () => { saveActiveRef.current?.() })
   }, [open, projectRoot, provenance, refresh, run, sessionId])
+
+  /** The live chapters in reading order, which is the order Alt+↑/↓ walks. */
+  const chapterOrder = useMemo(
+    () => (snapshot?.volumes ?? [])
+      .flatMap(volume => volume.chapters)
+      .filter(chapter => !chapter.archived)
+      .sort((left, right) => left.volume - right.volume || left.number - right.number),
+    [snapshot],
+  )
+
+  /**
+   * Walk the chapter tree, one chapter at a time.
+   *
+   * The jump goes through {@link loadChapter}, so it inherits the one thing a
+   * keyboard shortcut must not lose: the prompt about unsaved edits. A shortcut
+   * that bypassed that guard would be a way to lose a paragraph without touching
+   * the mouse.
+   * @param step - `-1` for the previous chapter, `1` for the next.
+   */
+  const moveChapter = useCallback((step: -1 | 1) => {
+    if (open === undefined) {
+      say('还没有打开章节——先在工程树里点一章')
+      return
+    }
+    const at = chapterOrder.findIndex(chapter => chapter.path === open.path)
+    if (at < 0) {
+      say('这一章不在工程树里（可能已存档）——先打开一章再翻')
+      return
+    }
+    const target = chapterOrder[at + step]
+    if (target === undefined) {
+      say(step < 0 ? '已经是第一章了' : '已经是最后一章了')
+      return
+    }
+    loadChapter(target.path)
+  }, [chapterOrder, loadChapter, open, say])
+
+  /**
+   * Save whichever document the author is looking at.
+   *
+   * `Ctrl+S` and the footer's 保存 button are the same action, which is why this
+   * exists rather than the shortcut calling `onSave` directly: half the author's
+   * saved work is cards and outlines, and a "save" key that silently saved a
+   * different file than the one on screen would be worse than no key at all.
+   */
+  const saveActive = useCallback(() => {
+    if (activeDoc === undefined) {
+      say('还没有打开任何文档——先在工程树或设定库里点一份，再保存')
+      return
+    }
+    if (activeDoc.surface === 'settings') {
+      setSettingsSaveToken(token => token + 1)
+      return
+    }
+    if (activeDoc.surface === 'outline') {
+      setOutlineSaveToken(token => token + 1)
+      return
+    }
+    onSave()
+  }, [activeDoc, onSave, say])
+  saveActiveRef.current = saveActive
+
+  /**
+   * Act on one keystroke, if it is one this panel binds.
+   *
+   * The handler lives on the panel root, so a key only ever means something while
+   * the author's focus is inside the panel: the shell's own shortcuts (and the
+   * browser's) stay untouched everywhere else, which is the whole reason this
+   * plugin does not register a global listener.
+   */
+  const onKeyDown = useCallback((event: {
+    key: string
+    ctrlKey: boolean
+    altKey: boolean
+    shiftKey: boolean
+    metaKey: boolean
+    preventDefault: () => void
+  }) => {
+    const action = actionFor(event)
+    if (action === undefined) return
+    // Every binding is ours once matched — including the save key, whose browser
+    // default is an OS "save page" dialog that must not appear over the editor.
+    event.preventDefault()
+    if (action === 'save') {
+      saveActive()
+      return
+    }
+    if (action === 'prev-chapter') {
+      moveChapter(-1)
+      return
+    }
+    if (action === 'next-chapter') {
+      moveChapter(1)
+      return
+    }
+    if (action === 'cancel') {
+      if (recordingThread) {
+        setRecordingThread(false)
+        setThreadDraft('')
+        say('已关掉「记为伏笔」表单')
+      } else if (status.tone === 'error') {
+        say('已清掉失败提示')
+      }
+      return
+    }
+    if (action.startsWith('section:')) {
+      // The action id *is* the section id (`section:checks`), so the mapping
+      // cannot drift from `PANEL_SECTIONS` — it is derived from it.
+      onSelectSection(action.slice('section:'.length) as Section)
+    }
+  }, [moveChapter, onSelectSection, recordingThread, saveActive, say, status.tone])
 
   /** Rename the book in `novel.yaml`, leaving every other field in that file alone. */
   const onRename = useCallback(() => {
@@ -652,7 +898,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     if (target === undefined) return
     const title = titleDraft.trim()
     if (title === '') {
-      setNote('书名不能为空')
+      say('书名不能为空')
       return
     }
     void run('改名', async () => {
@@ -742,8 +988,8 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     })
     setSection('prose')
     setProvenance(label)
-    setNote(`已采纳「${label}」到编辑器，确认后点保存落盘`)
-  }, [])
+    say(`已采纳「${label}」到编辑器，确认后点保存落盘`)
+  }, [say])
 
   const words = useMemo(() => (open === undefined ? 0 : countWords(open.body)), [open])
   /**
@@ -789,7 +1035,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   }, [checkReport, library, open, openVolume, root, sessionId, snapshot])
 
   return (
-    <div style={wrap}>
+    <div style={wrap} onKeyDown={onKeyDown}>
       <div style={row}>
         <input
           style={{ ...input, flex: '1 1 160px' }}
@@ -839,12 +1085,38 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
             key={item.id}
             type="button"
             style={{ ...button, fontWeight: section === item.id ? 600 : 400 }}
+            title={`${item.label}（${shortcutLabel(`section:${item.id}`) ?? ''}）`}
             onClick={() => { onSelectSection(item.id) }}
           >
             {item.label}
           </button>
         ))}
+        <button
+          type="button"
+          style={{ ...button, padding: '1px 6px', fontSize: 11 }}
+          title="这个面板认哪些键"
+          onClick={() => { setShowKeys(value => !value) }}
+        >
+          快捷键
+        </button>
       </div>
+
+      {/* The cheat-sheet is rendered from the bindings themselves, so it cannot
+          describe a key the panel no longer listens for. */}
+      {showKeys && (
+        <div style={{ ...box, maxHeight: 160 }}>
+          {shortcutHelp().map(entry => (
+            <div key={entry.keys} style={{ ...row, justifyContent: 'space-between' }}>
+              <span>{entry.description}</span>
+              <span style={caption}>{entry.keys}</span>
+            </div>
+          ))}
+          <div style={metaLine}>
+            键只在焦点位于这个面板里时生效；正文编辑器里的 Ctrl+Z 仍然是浏览器自己的逐字撤销，
+            回滚在「修改记录」页签里。
+          </div>
+        </div>
+      )}
 
       <div style={box}>
         {snapshot === undefined
@@ -1038,6 +1310,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
           <ThreadsView
             env={env}
             threads={threads}
+            archived={archivedThreads}
             chapters={snapshot.volumes.flatMap(volume => volume.chapters)}
             onJump={loadChapter}
             onOpenCard={openCard}
@@ -1058,6 +1331,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
             onOpenChapter={loadChapter}
             active={section === 'settings'}
             refreshToken={refreshToken}
+            saveToken={settingsSaveToken}
             onOpenDocument={onOpenDocument}
             {...(focusCard === undefined ? {} : { focus: focusCard })}
             {...(settingsLocate === undefined ? {} : { locate: settingsLocate })}
@@ -1076,6 +1350,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
             onChanged={async () => { await refresh(root.trim()) }}
             active={section === 'outline'}
             refreshToken={refreshToken}
+            saveToken={outlineSaveToken}
             onOpenDocument={onOpenDocument}
             {...(outlineLocate === undefined ? {} : { locate: outlineLocate })}
           />
@@ -1145,10 +1420,30 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
           {...(activeDoc === undefined ? {} : { path: activeDoc.path })}
           title={activeTitle}
           active={section === 'history'}
-          dirty={activeDoc === undefined ? false : activeDoc.surface === 'prose' ? dirty : activeDoc.dirty === true}
+          dirty={activeDirty}
           onRestored={onRestored}
           onLocate={locateQuote}
         />
+      </div>
+
+      {/* 导出（P5） */}
+      <div style={sectionStyle(section === 'export')}>
+        {snapshot !== undefined && (
+          <ExportView
+            env={env}
+            snapshot={snapshot}
+            {...(open === undefined
+              ? {}
+              : {
+                  openChapter: {
+                    path: open.path,
+                    title: field(open.data, 'title'),
+                    number: chapterNumberIn(snapshot, open),
+                    dirty,
+                  },
+                })}
+          />
+        )}
       </div>
 
       <div style={{ ...row, justifyContent: 'space-between' }}>
@@ -1170,15 +1465,40 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
           <button
             type="button"
             style={button}
-            disabled={busy || section !== 'prose' || open === undefined || !dirty}
-            onClick={onSave}
+            title={`保存当前文档${shortcutLabel('save') === undefined ? '' : `（${String(shortcutLabel('save'))}）`}`
+              + `${activeDoc === undefined ? '' : `：${activeTitle}`}`}
+            disabled={busy || activeDoc === undefined || !activeDirty}
+            onClick={saveActive}
           >
             保存
           </button>
         </span>
       </div>
-      <div style={{ ...metaLine, minHeight: 16 }}>
-        {busy ? '处理中…' : note}
+      {/* The status line, with its tone. The text is dim on purpose (it is not a
+          control), which is exactly why the failure state needs its own colour:
+          two messages that differ only in wording are read the same way at a
+          glance. The retry button is a sibling of the dimmed span, never a child
+          — `opacity` is inherited and would dim the control too. */}
+      <div style={{ ...row, minHeight: 16, alignItems: 'flex-start' }}>
+        <span style={{ ...metaLine, ...(status.tone === 'error' ? { color: ERROR_COLOR, opacity: 1 } : {}) }}>
+          {busy ? '处理中…' : status.text}
+        </span>
+        {status.tone === 'error' && retry !== undefined && (
+          <button
+            type="button"
+            style={{ ...button, padding: '1px 6px', fontSize: 11 }}
+            title={`再跑一次「${retry.label}」`}
+            disabled={busy}
+            onClick={() => {
+              // A redo re-derives the action from the current render; only the
+              // operations with nothing to re-derive fall back to the closure.
+              if (retry.redo === undefined) void run(retry.label, retry.operation)
+              else retry.redo()
+            }}
+          >
+            重试
+          </button>
+        )}
       </div>
     </div>
   )

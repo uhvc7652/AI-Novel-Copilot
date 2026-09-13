@@ -27,6 +27,7 @@
  * @module dsh-ai-novel-copilot/novel/search
  */
 import { CARD_LABELS, type CardType } from './paths.ts'
+import { isRetiredCard } from './cards.ts'
 import type { ThreadRecord } from './project.ts'
 
 /** What a searched document is. */
@@ -75,6 +76,8 @@ export interface SearchDoc {
   characters: string[]
   /** Chapter frontmatter location ids. */
   locations: string[]
+  /** Chapter frontmatter `refs`: the generic setting cards it is written against. */
+  refs: string[]
   /** Chapter point-of-view character id. */
   pov?: string
   /** A thread card's life, when the document is one. */
@@ -86,7 +89,7 @@ export interface SearchDoc {
 /** Why a document matched. */
 export type SearchReason =
   | 'card' | 'alias' | 'tag'
-  | 'characters' | 'locations' | 'pov'
+  | 'characters' | 'locations' | 'refs' | 'pov'
   | 'title' | 'summary' | 'beats' | 'body'
 
 /** Human-readable labels for {@link SearchReason}. */
@@ -96,6 +99,7 @@ export const REASON_LABELS: Record<SearchReason, string> = {
   tag: '命中标签',
   characters: '出场角色登记',
   locations: '地点登记',
+  refs: '本章引用的设定',
   pov: '视角人物',
   title: '标题',
   summary: '摘要',
@@ -275,6 +279,20 @@ export function queryTerms(query: string): string[] {
 }
 
 /**
+ * Whether a search doc is a card the author retired — deleted, or an abandoned thread.
+ * @param doc - one corpus document.
+ * @returns true when the card is out of the working set.
+ */
+function retiredDoc(doc: SearchDoc): boolean {
+  if (doc.kind !== 'card' || doc.cardType === undefined) return false
+  return isRetiredCard({
+    type: doc.cardType,
+    archived: doc.archived,
+    ...(doc.thread === undefined ? {} : { thread: doc.thread }),
+  })
+}
+
+/**
  * Resolve the cards a query names, by id, display name or alias.
  * @param docs - the corpus.
  * @param query - the raw query.
@@ -285,6 +303,13 @@ export function resolveEntities(docs: readonly SearchDoc[], query: string): Sear
   const found = new Map<string, SearchEntity>()
   for (const doc of docs) {
     if (doc.kind !== 'card' || doc.cardType === undefined) continue
+    // A retired card is not an entity: a deleted card, or a thread the author
+    // abandoned. This is the other half of "an abandoned line frees its name" —
+    // the collision rule can only stay quiet if resolution agrees, otherwise the
+    // author gets two cards answering to one name with one of them silently
+    // winning (`novel/cards.ts`). The card's *text* stays searchable; it just
+    // stops being an answer about the book.
+    if (retiredDoc(doc)) continue
     const candidates: { word: string, via: SearchEntity['via'] }[] = [
       { word: doc.id, via: 'id' },
       ...(doc.name === undefined || doc.name === doc.id ? [] : [{ word: doc.name, via: 'name' as const }]),
@@ -470,6 +495,7 @@ function chaptersNaming(entity: SearchEntity, chapters: readonly SearchDoc[]): S
   return chapters.filter(doc =>
     doc.characters.includes(entity.id)
     || doc.locations.includes(entity.id)
+    || doc.refs.includes(entity.id)
     || doc.pov === entity.id)
 }
 
@@ -483,11 +509,12 @@ function chaptersMentioning(entity: SearchEntity, chapters: readonly SearchDoc[]
 }
 
 /** Which frontmatter fields registered an entity in one chapter. */
-function refFields(entity: SearchEntity, doc: SearchDoc): string[] {
-  const fields: string[] = []
+function refFields(entity: SearchEntity, doc: SearchDoc): SearchReason[] {
+  const fields: SearchReason[] = []
   if (doc.pov === entity.id) fields.push('pov')
   if (doc.characters.includes(entity.id)) fields.push('characters')
   if (doc.locations.includes(entity.id)) fields.push('locations')
+  if (doc.refs.includes(entity.id)) fields.push('refs')
   return fields
 }
 
@@ -557,6 +584,14 @@ function buildAnswer(
       ? `按章节 frontmatter 的出场登记`
       : `章节 frontmatter 里没有登记它，只在正文里被提到`
     const lines = [`${about}${position}出场：${chapterLabel(wanted)}（${source}）。`]
+    // An archived chapter keeps its place in the answer — the author may be about
+    // to restore it, and the hit list has always marked archived matches — but a
+    // sentence that says "最近一次出场：第 7 章" without saying the chapter was
+    // withdrawn reads as a claim about the current book. So it says so.
+    if (wanted.archived) {
+      lines.push(`注意：${chapterLabel(wanted)}已经存档（不在书稿里，也不参与任务装配），上面这个位置来自被撤出的那一章。`)
+      evidence.push(`${wanted.path} · archived: true`)
+    }
     if (named.length > 1) lines.push(`全书共 ${String(named.length)} 章登记了它：${chapterList(named)}。`)
     else if (named.length === 1) lines.push('全书只有这一章登记了它。')
     if (!fromFrontmatter && mentioned.length > 0) {
@@ -659,7 +694,11 @@ export function searchDocs(
       // 1. Structural: the query named a card and this chapter registers it.
       const naming = entities.filter(entity => refFields(entity, doc).length > 0)
       for (const entity of naming) {
-        reasons.push(doc.pov === entity.id ? 'pov' : doc.characters.includes(entity.id) ? 'characters' : 'locations')
+        // The field that registered it **is** the reason, and `refFields` is also
+        // what the answer sentence cites — one reader, so a hit cannot be
+        // described by a field it did not actually match on.
+        const field = refFields(entity, doc)[0]
+        if (field !== undefined) reasons.push(field)
         score += 100
       }
 

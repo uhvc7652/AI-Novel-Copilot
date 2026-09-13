@@ -1,6 +1,7 @@
 node_modules/
 lib/
 novel/.novel/
+novel/
 .dsh-home/
 .spike-chrome/
 # The isolated dev instance's novel root (README's 启动 section). It is a scratch
@@ -9,3 +10,7 @@ novel/.novel/
 # The P5 benchmark's synthetic million-word book (spike/perf-check.mjs). Rebuilt
 # on every run; megabytes of generated prose, never part of the product.
 .spike-novel-perf/
+# Export output (format §4.10: derived, deliberately not in git). Without this a
+# `novel/exports/*.md` shows up as an untracked file the author has to reason
+# about — the format already says it is not theirs to commit.
+exports/

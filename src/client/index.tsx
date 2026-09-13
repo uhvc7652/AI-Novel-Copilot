@@ -20,6 +20,7 @@
 import { useCallback, useState } from 'react'
 import { Panel } from './Panel.tsx'
 import { ChecksView } from './ChecksView.tsx'
+import { ExportView } from './ExportView.tsx'
 import { HistoryView } from './HistoryView.tsx'
 import { ModelIssueList } from './IssueList.tsx'
 import { OutlineView } from './OutlineView.tsx'
@@ -27,6 +28,8 @@ import { SearchView } from './SearchView.tsx'
 import { SettingsView } from './SettingsView.tsx'
 import { TaskBar } from './TaskBar.tsx'
 import { ThreadsView } from './ThreadsView.tsx'
+import { TimelineEditor } from './TimelineEditor.tsx'
+import { ListField } from './ListField.tsx'
 
 /**
  * The view components, exported for `spike/client-load-check.mjs`.
@@ -38,7 +41,7 @@ import { ThreadsView } from './ThreadsView.tsx'
  * that can render each surface with real fixtures is the cheap half of that
  * lesson; the interactive half still needs the author's browser.
  */
-export const __views = { Panel, SettingsView, OutlineView, TaskBar, SearchView, ChecksView, HistoryView, ThreadsView, ModelIssueList }
+export const __views = { Panel, SettingsView, OutlineView, TaskBar, SearchView, ChecksView, HistoryView, ThreadsView, ModelIssueList, ExportView, TimelineEditor, ListField }
 
 /** This implementation's identity in the tab system, and the key its body registers under. */
 const NOVEL_ID = 'dsh-ai-novel-copilot'

@@ -17,6 +17,12 @@
  * @module dsh-ai-novel-copilot/novel/io
  */
 import { ProjectCache, type ScanRequest, type ScanSource, type ScannedFile } from './cache.ts'
+import {
+  ExportError,
+  renderExport,
+  type ExportPlan,
+  type ExportRequest,
+} from './book-export.ts'
 import { parseDocument, parseYamlData, serializeDocument, serializeYamlData } from './document.ts'
 import {
   actionOf,
@@ -29,6 +35,7 @@ import {
   CARD_LABELS,
   cardPath,
   compareHistoryFiles,
+  EXPORTS_DIR,
   freeHistoryStamp,
   historyDirOf,
   historyFileOf,
@@ -40,6 +47,7 @@ import {
   TIMELINE_FILE,
   WORLD_FILE,
 } from './paths.ts'
+import { CARD_SECTIONS } from './cards.ts'
 import { countWords } from './words.ts'
 import { checkProject, type CheckCard, type CheckChapter, type CheckCorpus, type CheckPage, type CheckRelation, type CheckReport } from './checks.ts'
 import {
@@ -203,6 +211,15 @@ export interface WrittenChapter {
   before: string | null
   /** Text after the write. */
   after: string
+  /**
+   * Why the modification record did not get a version, when it did not.
+   *
+   * The write itself succeeded — that is why this is a warning rather than an
+   * error — but "your edit is safe, its undo entry is not" is exactly the kind of
+   * half-failure an author has to be told about, since the record is the only
+   * way back (`11` §5 used to list this as "面板不会说").
+   */
+  warning?: string
 }
 
 /** The novel root and the enforcement context every call carries. */
@@ -237,6 +254,8 @@ export interface WrittenDocument {
   before: string | null
   /** Text after the write. */
   after: string
+  /** Why the modification record did not get a version, when it did not. */
+  warning?: string
 }
 
 /** One directory listing. */
@@ -287,6 +306,16 @@ export interface NewChapterSpec {
   characters?: string[]
   /** Location card ids the chapter uses. */
   locations?: string[]
+  /**
+   * Ids of the generic `lore` cards this chapter is written against.
+   *
+   * A separate field because the other two are read literally elsewhere — `pov`
+   * has to be in `characters`, and retrieval answers "who appears in which
+   * chapter" from both — so putting a cultivation ladder in `characters` would
+   * make those answers lie. These ids reach the chapter-writing task the same way
+   * character cards do.
+   */
+  refs?: string[]
   /** One-line summary. */
   summary?: string
   /** Point-of-view character id. */
@@ -303,23 +332,16 @@ function normalizeRelative(path: string): string {
 }
 
 /**
- * The body sections a new card starts with, per the format document.
+ * The body skeleton a new card starts with.
  *
- * A card is a place to think, not a blank file: the headings are the questions
- * the author would otherwise have to invent, and an untouched heading is
- * stripped from prompts as "not filled in yet" rather than fed to the model.
+ * The headings themselves live in `novel/cards.ts` (`CARD_SECTIONS`) because the
+ * panel's editor names the same sections in its placeholder: one table, so the
+ * textarea cannot describe a shape the scaffold does not write.
  * @param type - card type.
  * @returns the Markdown skeleton.
  */
 function cardSections(type: CardType): string {
-  const sections: Record<CardType, string[]> = {
-    character: ['外貌', '性格', '能力/境界（含成长曲线）', '动机与弧光', '不可违背的设定（硬约束）'],
-    location: ['地理', '氛围', '势力归属', '不可违背的设定（硬约束）'],
-    item: ['来历', '能力/用途', '不可违背的设定（硬约束）'],
-    faction: ['立场', '实力', '关键人物', '不可违背的设定（硬约束）'],
-    thread: ['埋点方式', '读者应有的疑问', '回收设计'],
-  }
-  return sections[type].map(title => `## ${title}\n`).join('\n')
+  return CARD_SECTIONS[type].map(title => `## ${title}\n`).join('\n')
 }
 
 /** Read a non-blank string field, or undefined. */
@@ -427,10 +449,10 @@ export class NovelIo {
     relative: string,
     content: string,
     source: HistorySource = { kind: 'manual' },
-  ): Promise<FsWriteOutcome> {
+  ): Promise<FsWriteOutcome & { warning?: string }> {
     const outcome = await this.writeRaw(scope, relative, content)
-    await this.recordHistory(scope, relative, outcome.before ?? '', content, source)
-    return outcome
+    const warning = await this.recordHistory(scope, relative, outcome.before ?? '', content, source)
+    return warning === undefined ? outcome : { ...outcome, warning }
   }
 
   /**
@@ -462,14 +484,16 @@ export class NovelIo {
    *    difference", and the author would stop trusting the list.
    * 2. **A history write that fails does not fail the save.** The chapter is
    *    already on disk by the time this runs; reporting a failure would be
-   *    reporting the wrong thing, so the problem is logged and the save stands.
-   *    (The panel cannot yet tell the author a version was not recorded — see
-   *    `11` §5.)
+   *    reporting the wrong thing, so the problem is logged **and returned** for
+   *    the caller to pass on as a warning. Until P5 it was only logged, which
+   *    meant the panel said "已保存" while the author's only way back had not
+   *    been written — a half-truth the panel now has the vocabulary to tell.
    * @param scope - project root and session.
    * @param relative - storage-relative path that was written.
    * @param before - the file's text before the write; empty when it did not exist.
    * @param after - the file's text after the write.
    * @param source - what produced the change.
+   * @returns why no version was recorded, or undefined when one was.
    */
   private async recordHistory(
     scope: NovelScope,
@@ -477,11 +501,11 @@ export class NovelIo {
     before: string,
     after: string,
     source: HistorySource,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     const path = normalizeRelative(relative)
     // `novel.yaml`, `.novel/*` and `runs/` are not documents: they have no panel
     // editing surface and no undo.
-    if (!isDocumentPath(path) || before === after) return
+    if (!isDocumentPath(path) || before === after) return undefined
     try {
       const beforeData = parseDocument(before).data
       const afterData = parseDocument(after).data
@@ -502,8 +526,11 @@ export class NovelIo {
         after,
       }
       await this.writeRaw(scope, historyFileOf(path, at), `${JSON.stringify(entry, null, 2)}\n`)
+      return undefined
     } catch (error) {
-      this.ctx.logger?.warn(`AI-Novel-Copilot: 修改记录写入失败（${path}）：${error instanceof Error ? error.message : String(error)}`)
+      const why = error instanceof Error ? error.message : String(error)
+      this.ctx.logger?.warn(`AI-Novel-Copilot: 修改记录写入失败（${path}）：${why}`)
+      return `修改记录没写进去（${why}）——文件已保存，但这一版不能回滚`
     }
   }
 
@@ -780,6 +807,7 @@ export class NovelIo {
       version: outcome.version,
       before: outcome.before,
       after: outcome.after,
+      ...(outcome.warning === undefined ? {} : { warning: outcome.warning }),
     }
   }
 
@@ -811,6 +839,7 @@ export class NovelIo {
       summary: spec.summary ?? '',
       characters: spec.characters ?? [],
       locations: spec.locations ?? [],
+      refs: spec.refs ?? [],
       tags: [],
     }
     await this.writeChapter(scope, path, data, '', spec.source ?? { kind: 'manual' })
@@ -869,6 +898,7 @@ export class NovelIo {
       version: outcome.version,
       before: outcome.before,
       after: outcome.after,
+      ...(outcome.warning === undefined ? {} : { warning: outcome.warning }),
     }
   }
 
@@ -1103,6 +1133,7 @@ export class NovelIo {
         beats: summary.beats,
         characters: summary.characters,
         locations: summary.locations,
+        refs: summary.refs,
         ...(summary.pov === undefined ? {} : { pov: summary.pov }),
         body,
       })
@@ -1125,6 +1156,7 @@ export class NovelIo {
         beats: summary.thread === undefined ? [] : threadChaptersOf(summary.thread),
         characters: [],
         locations: [],
+        refs: [],
         ...(summary.firstAppear === undefined ? {} : { firstAppear: summary.firstAppear }),
         ...(summary.thread === undefined ? {} : { thread: summary.thread }),
         body,
@@ -1219,6 +1251,7 @@ export class NovelIo {
       beats: [],
       characters: [],
       locations: [],
+      refs: [],
       body: entry.text,
     }))
   }
@@ -1235,7 +1268,7 @@ export class NovelIo {
    */
   async checkCorpus(scope: NovelScope): Promise<CheckCorpus> {
     const scanned = await this.scanChapterTexts(scope)
-    const chapters: CheckChapter[] = scanned.map(({ summary, data }) => {
+    const chapters: CheckChapter[] = scanned.map(({ summary, data, body }) => {
       const declaredId = stringOf(data.id)
       const targetWords = typeof summary.targetWords === 'number' ? summary.targetWords : undefined
       return {
@@ -1249,9 +1282,11 @@ export class NovelIo {
         ...(summary.pov === undefined ? {} : { pov: summary.pov }),
         characters: summary.characters,
         locations: summary.locations,
+        refs: summary.refs,
         ...(targetWords === undefined ? {} : { targetWords }),
         wordCount: summary.wordCount,
         archived: summary.archived,
+        body,
       }
     })
 
@@ -1355,6 +1390,68 @@ export class NovelIo {
     const path = `${MACHINE_DIR}/runs/${stamp}-consistency.json`
     await this.write(scope, path, `${JSON.stringify({ ...report, at: new Date().toISOString() }, null, 2)}\n`)
     return path
+  }
+
+  /**
+   * Render an export of the book without writing anything.
+   *
+   * The panel needs the text twice for two different reasons — a preview of what
+   * is about to be exported, and a download of the same bytes the export would
+   * write — and neither of them should create a file, so rendering and writing
+   * are two calls rather than one.
+   * @param scope - project root and session.
+   * @param request - format, scope, and the selection that scope needs.
+   * @returns the rendered content and the name it would be written under.
+   * @throws {NovelError} `novel/bad-request` when there is nothing to export.
+   */
+  async exportBook(scope: NovelScope, request: ExportRequest): Promise<ExportPlan> {
+    const meta = await this.projectMeta(scope)
+    const chapters = (await this.scanChapterTexts(scope)).map(entry => ({
+      path: entry.summary.path,
+      volume: entry.summary.volume,
+      number: entry.summary.number,
+      title: entry.summary.title,
+      body: entry.body,
+      archived: entry.summary.archived,
+    }))
+    try {
+      return renderExport(
+        { title: meta.title, ...(meta.genre === undefined ? {} : { genre: meta.genre }), chapters },
+        request,
+      )
+    } catch (error) {
+      // `book-export` is a pure module and cannot import `NovelError` from here
+      // without a cycle, so the one failure it raises is translated at this seam.
+      if (error instanceof ExportError) throw new NovelError('novel/bad-request', error.message)
+      throw error
+    }
+  }
+
+  /**
+   * Write an export under `exports/`.
+   *
+   * Deliberately **not** recorded in the modification record: an export is a
+   * derived product, not an edit of an author's document (format §1, §5), and a
+   * version entry per export would bury the changes it was taken from.
+   * @param scope - project root and session.
+   * @param request - format, scope, and the selection that scope needs.
+   * @returns the storage-relative path written, with the export's statistics.
+   * @throws {NovelError} `novel/bad-request` when there is nothing to export.
+   */
+  async saveExport(
+    scope: NovelScope,
+    request: ExportRequest,
+  ): Promise<{ path: string, chapters: number, words: number, bytes: number, fileName: string }> {
+    const plan = await this.exportBook(scope, request)
+    const path = `${EXPORTS_DIR}/${plan.fileName}`
+    await this.write(scope, path, plan.text)
+    return {
+      path,
+      chapters: plan.chapters,
+      words: plan.words,
+      bytes: plan.text.length,
+      fileName: plan.fileName,
+    }
   }
 
   /**

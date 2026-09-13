@@ -8,7 +8,8 @@
  * ```
  * novel.yaml                    project metadata
  * chapters/v01/c0001.md         one file per chapter
- * settings/                     world, characters, locations, items, factions
+ * settings/                     world, characters, locations, items, factions, lore
+ * settings/lore/                generic worldbuilding cards (a ladder, a system, a rule)
  * outline/book.md               book line and volume structure
  * outline/volumes/v01.md        volume outline and chapter beats
  * style/style-guide.md          voice rules
@@ -22,6 +23,7 @@
  * @module dsh-ai-novel-copilot/novel/project
  */
 import { parseDocument } from './document.ts'
+import { roleLabels } from './cards.ts'
 import {
   CARD_DIRS,
   CARD_LABELS,
@@ -76,6 +78,16 @@ export interface ChapterSummary {
   characters: string[]
   /** Location card ids this chapter uses. */
   locations: string[]
+  /**
+   * Ids of the generic `lore` cards this chapter is written against.
+   *
+   * The worldbuilding a chapter depends on that is neither a person nor a place:
+   * a cultivation ladder, a magic system, a rule. They reach the chapter-writing
+   * task exactly as `characters` do, which is why "start a chapter, reference the
+   * setting" works without touching `characters` (whose meaning is read literally
+   * by `pov-unlisted` and by retrieval's "who appears in which chapter").
+   */
+  refs: string[]
   /**
    * Whether the author retired this chapter.
    *
@@ -195,6 +207,24 @@ function numberField(data: Record<string, unknown>, key: string): number | undef
   return undefined
 }
 
+/**
+ * Read a short scalar as display text.
+ *
+ * `stringField` is for fields the format writes as strings; `age` and `gender`
+ * are things an author writes however they like (`age: 19`, `sex: 男`,
+ * `gender: 十九岁`), and a number arriving where text was expected must still
+ * reach the panel and the prompt rather than silently vanishing.
+ * @param data - frontmatter data.
+ * @param key - field name.
+ * @returns the text, or undefined when the field is absent or blank.
+ */
+function textField(data: Record<string, unknown>, key: string): string | undefined {
+  const value = data[key]
+  if (typeof value === 'string') return value.trim() === '' ? undefined : value.trim()
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  return undefined
+}
+
 /** Read a status field, defaulting to `draft` for anything unrecognized. */
 function statusField(data: Record<string, unknown>): ChapterStatus {
   const value = data.status
@@ -266,6 +296,7 @@ export function summarizeParsedChapter(
     ...(pov === '' ? {} : { pov }),
     characters: stringArrayField(data, 'characters'),
     locations: stringArrayField(data, 'locations'),
+    refs: stringArrayField(data, 'refs'),
     archived: data.archived === true,
   }
 }
@@ -291,6 +322,7 @@ export function referenceIndex(chapters: readonly ChapterSummary[]): Map<string,
     if (chapter.pov !== undefined) add(chapter.pov, chapter.id)
     for (const id of chapter.characters) add(id, chapter.id)
     for (const id of chapter.locations) add(id, chapter.id)
+    for (const id of chapter.refs) add(id, chapter.id)
   }
   return index
 }
@@ -388,8 +420,29 @@ export interface CardSummary {
   name: string
   /** Alternative names, used for retrieval and conflict detection. */
   aliases: string[]
-  /** Free-form role label (a character's `role`, a faction's stance…). */
+  /**
+   * Free-form role labels (a character's `role`, a faction's stance…).
+   *
+   * The field holds **one label or a list of labels** (format §4.3): a character
+   * can be 「主角」and「前朝皇子」at once. The summary joins them with `、`, which is
+   * also how they reach a prompt.
+   */
   role?: string
+  /**
+   * A character's age, as written.
+   *
+   * Text rather than a number because the format's `age: 19` is a convention, not
+   * a rule: `十九` and `19` are both things an author writes, and a card whose age
+   * vanished on the way to the panel would be a field nobody could trust.
+   */
+  age?: string
+  /**
+   * A character's gender (format §4.3), as written.
+   *
+   * The model gets this — see `cardFacts` in `client/tasks.ts` — because it is
+   * exactly the kind of fact a generator gets wrong on its own.
+   */
+  gender?: string
   /**
    * The card's `status` field, verbatim: a thread's lifecycle
    * (`planted`/`reinforced`/`paid`/`abandoned`), empty otherwise.
@@ -483,9 +536,11 @@ export function summarizeParsedCard(
   const type = cardTypeOfPath(path)
   const id = cardIdOfPath(path)
   if (type === undefined || id === undefined) return undefined
-  const role = stringField(data, 'role', '')
+  const role = roleLabels(data.role).join('、')
   const firstAppear = stringField(data, 'firstAppear', '')
   const name = stringField(data, 'name', stringField(data, 'title', id))
+  const age = textField(data, 'age')
+  const gender = textField(data, 'gender')
   return {
     path,
     id,
@@ -493,6 +548,8 @@ export function summarizeParsedCard(
     name,
     aliases: stringArrayField(data, 'aliases'),
     ...(role === '' ? {} : { role }),
+    ...(age === undefined ? {} : { age }),
+    ...(gender === undefined ? {} : { gender }),
     status: stringField(data, 'status', ''),
     archived: data.archived === true,
     tags: stringArrayField(data, 'tags'),
@@ -652,6 +709,7 @@ export function scaffoldFiles(title: string): ScaffoldFile[] {
         'summary: ""',
         'characters: []',
         'locations: []',
+        'refs: []',
         'tags: []',
         '---',
         '',

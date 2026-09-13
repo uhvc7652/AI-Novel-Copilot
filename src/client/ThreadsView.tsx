@@ -29,8 +29,17 @@ import { box, button, caption, controlRow, listRow, metaLine, row, THREAD_STATUS
 export interface ThreadsViewProps {
   /** Shared panel environment. */
   env: PanelEnv
-  /** Every thread card in the project. */
+  /**
+   * Every thread card in the project — **live ones only**.
+   *
+   * A deleted (archived) thread is not listed here: deleting is how the author
+   * says "this line is not part of the book any more", and a list that keeps
+   * showing it is a list they stop trusting. The count of what was left out
+   * arrives as {@link ThreadsViewProps.archived} so the surface can say so.
+   */
   threads: readonly CardSummary[]
+  /** How many thread cards are archived (deleted), for the one line that says where they went. */
+  archived?: number
   /** Every chapter, so an id can be shown as 「第 N 章」 and jumped to. */
   chapters: readonly ChapterSummary[]
   /** Open a chapter, optionally putting the cursor on a quoted sentence. */
@@ -73,7 +82,7 @@ function groupThreads(threads: readonly CardSummary[]): Group[] {
   return [
     { key: 'open', title: '未回收', hint: '埋下了还没收的线。这是这个页面存在的理由。', threads: open.sort(byName) },
     { key: 'paid', title: '已回收', hint: '已经收口的线，留着备查。', threads: paid.sort(byName) },
-    { key: 'dropped', title: '已废弃', hint: '决定不要的线。', threads: dropped.sort(byName) },
+    { key: 'dropped', title: '已废弃', hint: '决定不要的线：它的名字不再占用，也可以随时恢复。', threads: dropped.sort(byName) },
   ].filter(group => group.threads.length > 0)
 }
 
@@ -81,7 +90,7 @@ function groupThreads(threads: readonly CardSummary[]): Group[] {
  * The foreshadowing view.
  * @param props - environment, the threads, the chapters, and the three callbacks.
  */
-export function ThreadsView({ env, threads, chapters, onJump, onOpenCard, onReload, openChapter }: ThreadsViewProps) {
+export function ThreadsView({ env, threads, archived, chapters, onJump, onOpenCard, onReload, openChapter }: ThreadsViewProps) {
   /** Which group the author folded away; the open ones start unfolded. */
   const [folded, setFolded] = useState<readonly string[]>(['paid', 'dropped'])
 
@@ -128,6 +137,7 @@ export function ThreadsView({ env, threads, chapters, onJump, onOpenCard, onRelo
       <div style={metaLine}>
         还没有伏笔。在正文页把光标放到埋点那一句上，点「记为伏笔」——之后这里会列出它、
         埋在哪一句、收了没有，以及怎么跳回去。
+        {(archived ?? 0) > 0 && `（另有 ${String(archived)} 条已删除的伏笔：在「设定」页勾「显示已存档」能看到并恢复。）`}
       </div>
     )
   }
@@ -137,10 +147,17 @@ export function ThreadsView({ env, threads, chapters, onJump, onOpenCard, onRelo
       <div style={controlRow}>
         <span style={caption}>
           共 {String(threads.length)} 条 · 未回收 <strong>{String(openCount)}</strong> 条
+          {(archived ?? 0) === 0 ? '' : ` · 已删除 ${String(archived)} 条`}
           {openChapter === undefined ? '' : ` · 当前章可以回收`}
         </span>
         <button type="button" style={button} disabled={env.busy} onClick={() => { void onReload() }}>刷新</button>
       </div>
+      {(archived ?? 0) > 0 && (
+        <div style={metaLine}>
+          已删除（存档）的伏笔不在这里，也不参与一致性检查；在「设定」页勾「显示已存档」能看到它并恢复，
+          恢复之后它会重新出现在这一页。
+        </div>
+      )}
 
       {groups.map(group => (
         <div key={group.key} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>

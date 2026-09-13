@@ -141,6 +141,32 @@ await call('doc rejects novel.yaml', `/api/novel/doc?${scope}&path=${encodeURICo
 await call('doc rejects escape', `/api/novel/doc?${scope}&path=${encodeURIComponent('../../etc/hosts.md')}`)
 await call('dir settings', `/api/novel/dir?${scope}&path=${encodeURIComponent('settings/characters')}`)
 await call('dir absent', `/api/novel/dir?${scope}&path=${encodeURIComponent('settings/items')}`)
+// P5's export: the preview (GET) and the write (POST) must agree, and an export
+// is not a document — the list of what it wrote is the only record of it.
+await call('export preview md', `/api/novel/export?${scope}&format=md&scope=book`)
+await call('export preview txt', `/api/novel/export?${scope}&format=txt&scope=book`)
+await call('export preview volume', `/api/novel/export?${scope}&format=md&scope=volume&volume=1`)
+await call('export write', '/api/novel/export', post({
+  sessionId: 'unknown-session',
+  root,
+  format: 'md',
+  scope: 'book',
+}))
+await call('export missing chapter', '/api/novel/export', post({
+  sessionId: 'unknown-session',
+  root,
+  format: 'md',
+  scope: 'chapter',
+  path: 'chapters/v01/c9999.md',
+}))
+await call('export volume without a volume', '/api/novel/export', post({
+  sessionId: 'unknown-session',
+  root,
+  format: 'md',
+  scope: 'volume',
+}))
+await call('dir exports', `/api/novel/dir?${scope}&path=${encodeURIComponent('exports')}`)
+await call('no history for exports', `/api/novel/dir?${scope}&path=${encodeURIComponent('.novel/history/exports')}`)
 await call('project after cards', `/api/novel/project?${scope}`)
 await call('read back', `/api/novel/chapter?${scope}&path=${encodeURIComponent('chapters/v01/c0001.md')}`)
 await call('escape guard', `/api/novel/chapter?${scope}&path=${encodeURIComponent('../../etc/passwd')}`)

@@ -27,6 +27,9 @@
  * @module dsh-ai-novel-copilot/novel/checks
  */
 import { TIMELINE_FILE, type CardType } from './paths.ts'
+import { isRetiredCard, liveCards as liveCardsOf } from './cards.ts'
+import { parseTimeline } from './timeline.ts'
+import { findQuote } from './quote.ts'
 import type { ThreadRecord } from './project.ts'
 
 /** One chapter, as a consistency check sees it. */
@@ -47,11 +50,23 @@ export interface CheckChapter {
   characters: string[]
   /** Location card ids the chapter uses. */
   locations: string[]
+  /** Generic `lore` card ids the chapter is written against. */
+  refs: string[]
   /** Target length, when the outline set one. */
   targetWords?: number
   /** Measured body length. */
   wordCount: number
   archived: boolean
+  /**
+   * The chapter's prose.
+   *
+   * Read by the rules that are about text rather than metadata — today that is
+   * `thread-quote`, which has to look for a recorded sentence in the chapter it
+   * was recorded from. It costs nothing: the scan reads every body anyway (the
+   * search corpus needs it), so the alternative would be reading the same file
+   * twice to answer the same question.
+   */
+  body: string
 }
 
 /** One card-to-card reference. */
@@ -106,6 +121,7 @@ export type CheckRule =
   | 'word-drift'
   | 'firstappear-mismatch'
   | 'archived-ref'
+  | 'thread-quote'
 
 /** Human-readable rule names, for the report's group headings. */
 export const RULE_LABELS: Record<CheckRule, string> = {
@@ -123,6 +139,7 @@ export const RULE_LABELS: Record<CheckRule, string> = {
   'word-drift': '字数与目标严重偏离',
   'firstappear-mismatch': 'firstAppear 与最早的出场登记不一致',
   'archived-ref': '还在引用已存档的卡',
+  'thread-quote': '伏笔的原句在正文里找不到了',
 }
 
 /** How much a finding matters. */
@@ -213,31 +230,6 @@ function chapterLabel(chapter: CheckChapter): string {
 }
 
 /**
- * Read a Markdown table's rows out of the timeline.
- *
- * The format fixes the timeline as one plain table whose last column names the
- * chapter (§4.5), so the parser reads exactly that and nothing more: header and
- * separator rows are skipped, and a row that names no chapter id is not a row
- * this check can evaluate.
- * @param body - the timeline file's text.
- * @returns the rows that name at least one chapter, in table order.
- */
-function timelineRows(body: string): { ids: string[], line: string, lineNo: number }[] {
-  const rows: { ids: string[], line: string, lineNo: number }[] = []
-  const lines = body.split(/\r?\n/)
-  for (const [index, raw] of lines.entries()) {
-    const line = raw.trim()
-    if (!line.startsWith('|')) continue
-    if (/^\|[\s:|-]+\|$/.test(line)) continue
-    const cells = line.replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim())
-    if (cells[0] === '叙事序') continue
-    const ids = [...(cells.at(-1) ?? '').matchAll(/c\d{3,}/g)].map(match => match[0])
-    if (ids.length > 0) rows.push({ ids, line, lineNo: index + 1 })
-  }
-  return rows
-}
-
-/**
  * Run every deterministic rule over a corpus.
  *
  * Findings come back sorted by severity, then by story order for chapter-scoped
@@ -261,9 +253,29 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   const chapterOf = (id: string): CheckChapter | undefined => byFileId.get(id) ?? byDeclared.get(id)
   const cardById = new Map(corpus.cards.map(card => [card.id, card]))
   const cardIds = new Set(cardById.keys())
+  /**
+   * The cards the author is working with — deleted cards **and abandoned
+   * threads** are out (`novel/cards.ts`, the same predicate the panel uses).
+   *
+   * The rules about **naming and lifecycle** only speak about these. The author
+   * deleted a 伏笔 and wrote a new one under the same name, and later did it again
+   * by *abandoning* the old one: both times the retired card came back as two
+   * `alias-clash` errors, which is the daily false positive §1.6 exists to
+   * prevent. An abandoned line is not in the book any more, so its name is free.
+   *
+   * **Id resolution below still uses every card**, retired ones included — see
+   * {@link cardIds}. Deleting a card must not turn every chapter that mentions it
+   * into a dangling reference; that is what `archived-ref` (info, live chapter →
+   * archived card) says instead.
+   */
+  const liveCards = liveCardsOf(corpus.cards)
 
   // ── 1. Chapter frontmatter naming cards that do not exist ──────────────────
-  for (const chapter of corpus.chapters) {
+  //
+  // Live chapters only, and the same line as everywhere else in this file: an
+  // archived chapter is out of the book, so its frontmatter is not a claim the
+  // author needs to hear about. Restoring the chapter brings the finding back.
+  for (const chapter of live) {
     const missing = new Map<string, string[]>()
     const note = (id: string, field: string): void => {
       missing.set(id, [...(missing.get(id) ?? []), field])
@@ -271,6 +283,7 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
     if (chapter.pov !== undefined && !cardIds.has(chapter.pov)) note(chapter.pov, 'pov')
     for (const id of chapter.characters) if (!cardIds.has(id)) note(id, 'characters')
     for (const id of chapter.locations) if (!cardIds.has(id)) note(id, 'locations')
+    for (const id of chapter.refs) if (!cardIds.has(id)) note(id, 'refs')
     for (const [id, fields] of missing) {
       found.push(issue(
         'missing-ref',
@@ -286,7 +299,7 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 2. Setting cards naming cards that do not exist ───────────────────────
-  for (const card of corpus.cards) {
+  for (const card of liveCards) {
     for (const relation of card.relations) {
       if (!cardIds.has(relation.to)) {
         found.push(issue(
@@ -315,7 +328,7 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 3. Threads naming chapters that do not exist, and their lifecycle ─────
-  for (const card of corpus.cards) {
+  for (const card of liveCards) {
     const thread = card.thread
     if (thread === undefined) continue
     const named: { id: string, field: string }[] = [
@@ -381,11 +394,68 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
         }
       }
     }
+
+    // ── 3b. The recorded sentence can no longer be found ────────────────────
+    //
+    // `plantedQuote` / `payoffQuote` are stored as the sentence itself rather than
+    // as an offset (`03` §4.4), which is what makes them survive edits above them
+    // — and what makes them **expire** when that sentence is rewritten. The
+    // format's answer to "the text changed" is to say so instead of pointing at
+    // whatever now occupies those characters; this rule is the other half of that
+    // promise: the panel can only say it when someone clicks, and a record nobody
+    // clicks is a record that quietly stops meaning anything (`12` §4).
+    //
+    // The finder is the panel's own (`novel/quote.ts`), tolerance included, so the
+    // report and the 「跳回埋点」 button cannot disagree about the same sentence.
+    const quoted: { field: 'plantedQuote' | 'payoffQuote', text: string, chapters: CheckChapter[], label: string }[] = []
+    if (thread.plantedIn !== undefined) {
+      const planted = chapterOf(thread.plantedIn)
+      if (planted !== undefined && thread.plantedQuote !== undefined) {
+        quoted.push({ field: 'plantedQuote', text: thread.plantedQuote, chapters: [planted], label: '埋点' })
+      }
+    }
+    if (thread.payoffQuote !== undefined) {
+      // The quote is not tied to one chapter in the file: the panel appends the
+      // chapter it collected in and writes that sentence, but a hand-edited card
+      // may list several. So the sentence counts as present when **any** recorded
+      // payoff chapter contains it — the alternative reports a stale quote for a
+      // sentence the author can see with their own eyes.
+      const paidChapters = thread.payoffIn
+        .map(id => chapterOf(id))
+        .filter((chapter): chapter is CheckChapter => chapter !== undefined)
+      if (paidChapters.length > 0) {
+        quoted.push({ field: 'payoffQuote', text: thread.payoffQuote, chapters: paidChapters, label: '回收' })
+      }
+    }
+    for (const entry of quoted) {
+      if (entry.text.trim() === '') continue
+      const where = entry.chapters.map(chapter => `${chapter.path} · ${chapterLabel(chapter)}`).join('、')
+      const stillThere = entry.chapters.some(chapter => findQuote(chapter.body, entry.text).kind === 'found')
+      if (stillThere) continue
+      const shown = entry.text.trim()
+      found.push(issue(
+        'thread-quote',
+        'warn',
+        card.path,
+        `${entry.field}:${entry.chapters.map(chapter => chapter.fileId).join(',')}`,
+        `伏笔「${card.name}」的${entry.label}原句在当前正文里找不到了`,
+        `${entry.field} 存的是当时那一句原文；那一句被改写（或整段删掉）之后，这条记录就指不到东西了。`
+        + '要么把原句更新成现在的那一句，要么在正文里重新记一次这条伏笔。',
+        [
+          `${card.path} · ${entry.field}: ${shown.length > 40 ? `${shown.slice(0, 40)}…` : shown}`,
+          `${where} 里找不到这一句`,
+        ],
+        { card: card.path, chapter: entry.chapters[0]?.path },
+      ))
+    }
   }
 
   // ── 4. Name and alias collisions ──────────────────────────────────────────
+  //
+  // Only among live cards: a collision with a card the author deleted is not a
+  // collision in the book they are writing.
   const byWord = new Map<string, { card: CheckCard, kind: 'name' | 'alias' }[]>()
-  for (const card of corpus.cards) {
+  for (const card of liveCards) {
     const words: { word: string, kind: 'name' | 'alias' }[] = [
       { word: card.name, kind: 'name' },
       ...card.aliases.map(alias => ({ word: alias, kind: 'alias' as const })),
@@ -414,10 +484,12 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
       ))
     }
   }
-  for (const card of corpus.cards) {
+  for (const card of liveCards) {
     for (const alias of card.aliases) {
       const other = cardById.get(alias.trim())
-      if (other === undefined || other.path === card.path) continue
+      // An alias pointing at a *retired* card's id is the same non-collision as a
+      // shared name: that card is no longer in the working set.
+      if (other === undefined || other.path === card.path || isRetiredCard(other)) continue
       found.push(issue(
         'alias-clash',
         'warn',
@@ -477,6 +549,14 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 6. The id a chapter declares against the id its filename encodes ──────
+  //
+  // **Every chapter, archived ones included** — this is the one chapter rule that
+  // deliberately does not follow the "archived chapters are out" line, and the
+  // reason is the other half of that line: an archived chapter keeps its id as a
+  // valid **reference target** (`chapterOf` resolves archived chapters, so a
+  // thread's `plantedIn` can still name one). A file whose declared id disagrees
+  // with its filename therefore makes live references land on the wrong thing —
+  // a consequence for the book the author is still writing.
   for (const chapter of corpus.chapters) {
     if (chapter.declaredId === undefined || chapter.declaredId === chapter.fileId) continue
     found.push(issue(
@@ -492,11 +572,15 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 7. The timeline: dangling references and narrative order ─────────────
+  //
+  // The rows come from `novel/timeline.ts`, the same parser the panel's timeline
+  // editor renders with: an editor that wrote a table the checks read differently
+  // would be worse than no editor.
   const timeline = corpus.pages.find(page => page.path === TIMELINE_FILE)
   if (timeline !== undefined) {
-    const rows = timelineRows(timeline.body)
+    const rows = parseTimeline(timeline.body).rows
     for (const row of rows) {
-      for (const id of row.ids) {
+      for (const id of row.chapters) {
         if (chapterOf(id) !== undefined) continue
         found.push(issue(
           'timeline-ref',
@@ -511,7 +595,7 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
     }
     let previous: { chapter: CheckChapter, lineNo: number, line: string } | undefined
     for (const row of rows) {
-      const first = row.ids
+      const first = row.chapters
         .map(id => chapterOf(id))
         .find((chapter): chapter is CheckChapter => chapter !== undefined)
       if (first === undefined) continue
@@ -531,7 +615,10 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 8. Point of view not listed among the chapter's characters ───────────
-  for (const chapter of corpus.chapters) {
+  //
+  // Live chapters only: `pov` and `characters` exist to decide what a *task*
+  // carries, and an archived chapter is never assembled into one (`client/tasks.ts`).
+  for (const chapter of live) {
     if (chapter.pov === undefined || chapter.characters.includes(chapter.pov)) continue
     found.push(issue(
       'pov-unlisted',
@@ -546,7 +633,11 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 9. Length against target ─────────────────────────────────────────────
-  for (const chapter of corpus.chapters) {
+  //
+  // Live chapters only: an archived chapter is out of the word counts (`snapshot`
+  // counts the live book), so its length against a target is not a fact about the
+  // book any more — reporting it was the other half of what the author asked for.
+  for (const chapter of live) {
     const target = chapter.targetWords
     if (target === undefined || target <= 0 || chapter.wordCount <= 0) continue
     const drift = Math.abs(chapter.wordCount - target) / target
@@ -565,11 +656,15 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
   }
 
   // ── 10. firstAppear against the earliest chapter that names the card ─────
-  for (const card of corpus.cards) {
+  //
+  // "Earliest" is over **live** chapters: the card is in the working set, so a
+  // chapter the author withdrew must not be what contradicts its `firstAppear`.
+  for (const card of liveCards) {
     if (card.firstAppear === undefined || card.type === 'thread') continue
-    const naming = corpus.chapters
+    const naming = live
       .filter(chapter =>
-        chapter.characters.includes(card.id) || chapter.locations.includes(card.id) || chapter.pov === card.id)
+        chapter.characters.includes(card.id) || chapter.locations.includes(card.id)
+        || chapter.refs.includes(card.id) || chapter.pov === card.id)
       .sort((left, right) => (left.volume - right.volume) || (left.number - right.number))
     const named = chapterOf(card.firstAppear)
     if (named === undefined) {
@@ -606,6 +701,7 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
       ...(chapter.pov === undefined ? [] : [chapter.pov]),
       ...chapter.characters,
       ...chapter.locations,
+      ...chapter.refs,
     ])
     for (const id of used) {
       const card = cardById.get(id)

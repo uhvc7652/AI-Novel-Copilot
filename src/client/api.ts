@@ -84,7 +84,24 @@ async function describeNonJson(path: string, status: number, probe: boolean): Pr
  * @returns the unwrapped payload.
  */
 async function call<T extends Envelope>(path: string, init?: RequestInit, probe = true): Promise<T> {
-  const response = await fetch(path, { credentials: 'include', ...init })
+  let response: Response
+  try {
+    response = await fetch(path, { credentials: 'include', ...init })
+  } catch (error) {
+    // A transport failure is not an HTTP failure: nothing answered at all. The
+    // browser's own text for it (`Failed to fetch`) names neither the host nor
+    // anything the author can do, and this is the message an author sees when a
+    // dev instance was restarted under an open page — the single most common way
+    // to meet it. So it says which route went unanswered and what to try.
+    const route = path.split('?')[0] ?? path
+    const why = error instanceof Error ? error.message : String(error)
+    const offline = new Error(
+      `没能连上 DSH host：${route} 没有得到任何响应。`
+      + `如果这个实例刚重启或已经关掉，刷新页面后再试；还不行就看 host 进程是否还在跑。（${why}）`,
+    )
+    offline.name = 'novel/offline'
+    throw offline
+  }
   let value: T
   try {
     value = await response.json() as T
@@ -98,6 +115,29 @@ async function call<T extends Envelope>(path: string, init?: RequestInit, probe 
     throw error
   }
   return value
+}
+
+/**
+ * The stable code worth printing beside a failure, when there is one.
+ *
+ * Two families of code reach the panel and neither is something the author can
+ * act on by itself, but both say *which layer* refused: the host half's own
+ * `novel/*` (this plugin's rules) and the filesystem's `FS_*` (the sandbox and
+ * the version guard — `FS_PERMISSION_DENIED` and `FS_STALE_VERSION` are the two
+ * an author actually meets). Everything else is an ordinary JavaScript error
+ * name (`TypeError`, `Error`) which means nothing to whoever reads the status
+ * line, so it is not printed.
+ *
+ * The rule lives here, next to {@link call}, because this is where a thrown
+ * error gets its `name` from the host's `error.code`; the panel only formats it.
+ * @param error - whatever was thrown.
+ * @returns the code, or undefined when there is nothing worth printing.
+ */
+export function errorCodeOf(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined
+  // The fallback this module assigns when the host sent no code at all.
+  if (error.name === 'novel/unknown') return undefined
+  return /^(?:novel\/|FS_)/.test(error.name) ? error.name : undefined
 }
 
 /** JSON POST body helper. */
@@ -497,6 +537,126 @@ export interface RunSubmission {
 export async function writeRun(sessionId: string, root: string, run: RunSubmission): Promise<string> {
   const value = await call<Envelope & { path: string }>(`${BASE}/run`, post({ sessionId, root, ...run }))
   return value.path
+}
+
+/** Which part of the book an export covers. */
+export type ExportScope = 'book' | 'volume' | 'chapter'
+
+/** What to export. */
+export interface ExportSpec {
+  format: 'md' | 'txt'
+  scope: ExportScope
+  /** Volume number, for `scope: 'volume'`. */
+  volume?: number
+  /** Chapter path, for `scope: 'chapter'`. */
+  path?: string
+}
+
+/** A rendered export, as the host answers with it. */
+export interface ExportPlan {
+  /** The complete file content, or its opening when a head was asked for. */
+  text: string
+  /** Suggested filename, extension included. */
+  fileName: string
+  /** How many chapters it contains. */
+  chapters: number
+  /** Word count of the exported prose. */
+  words: number
+  /** `全书` / `第 1 卷` / `第 3 章`. */
+  scopeLabel: string
+  /** Character count of the **complete** export, not of `text`. */
+  bytes: number
+  /** Whether `text` is only the opening of the export. */
+  truncated: boolean
+}
+
+/** Turn a spec into query parameters, omitting what the scope does not use. */
+function exportQuery(spec: ExportSpec): Record<string, string> {
+  return {
+    format: spec.format,
+    scope: spec.scope,
+    ...(spec.volume === undefined ? {} : { volume: String(spec.volume) }),
+    ...(spec.path === undefined ? {} : { path: spec.path }),
+  }
+}
+
+/**
+ * Render an export without writing it.
+ *
+ * Two callers, one route: the **preview** asks for `head` characters so opening
+ * the tab on a million-word book does not download the book, and the **download**
+ * asks for everything — it is the file the author is taking away, and it is the
+ * same string the host's own `exports/` write contains, so the two cannot drift
+ * apart.
+ * @param sessionId - session whose sandbox policy applies.
+ * @param root - absolute project root.
+ * @param spec - format, scope, and selection.
+ * @param head - return only the first this-many characters; omitted means the whole file.
+ * @returns the rendered text and its statistics (always the whole export's).
+ */
+export async function readExport(
+  sessionId: string,
+  root: string,
+  spec: ExportSpec,
+  head?: number,
+): Promise<ExportPlan> {
+  const value = await call<Envelope & ExportPlan>(
+    `${BASE}/export${scopeQuery(sessionId, root, {
+      ...exportQuery(spec),
+      ...(head === undefined ? {} : { head: String(head) }),
+    })}`,
+  )
+  return {
+    text: value.text,
+    fileName: value.fileName,
+    chapters: value.chapters,
+    words: value.words,
+    scopeLabel: value.scopeLabel,
+    bytes: value.bytes,
+    truncated: value.truncated === true,
+  }
+}
+
+/** Where an export was written, and what went into it. */
+export interface SavedExport {
+  /** Storage-relative path under `exports/`. */
+  path: string
+  chapters: number
+  words: number
+  bytes: number
+  fileName: string
+}
+
+/**
+ * Write an export under `exports/`.
+ * @param sessionId - session whose sandbox policy applies.
+ * @param root - absolute project root.
+ * @param spec - format, scope, and selection.
+ * @returns the path written and the export's statistics.
+ */
+export async function writeExport(
+  sessionId: string,
+  root: string,
+  spec: ExportSpec,
+): Promise<SavedExport> {
+  const value = await call<Envelope & SavedExport>(
+    `${BASE}/export`,
+    post({
+      sessionId,
+      root,
+      format: spec.format,
+      scope: spec.scope,
+      ...(spec.volume === undefined ? {} : { volume: spec.volume }),
+      ...(spec.path === undefined ? {} : { path: spec.path }),
+    }),
+  )
+  return {
+    path: value.path,
+    chapters: value.chapters,
+    words: value.words,
+    bytes: value.bytes,
+    fileName: value.fileName,
+  }
 }
 
 /** Project metadata as the host reports it. */

@@ -21,6 +21,8 @@ export interface PlanChapter {
   characters: string[]
   /** Location card ids the chapter uses. */
   locations: string[]
+  /** Generic `lore` card ids the chapter is written against (format §4.3). */
+  refs: string[]
   /** One-line summary, when the model supplied one. */
   summary?: string
   /** Target length in words, when the model supplied one. */
@@ -90,6 +92,7 @@ export function parsePlan(text: string): PlanParseResult {
       beats: stringsOf(raw.beats),
       characters: stringsOf(raw.characters),
       locations: stringsOf(raw.locations),
+      refs: stringsOf(raw.refs),
       ...(summary === '' ? {} : { summary }),
       ...(targetWords === undefined ? {} : { targetWords }),
     })

@@ -24,7 +24,8 @@
  *
  * @module dsh-ai-novel-copilot/client/tasks
  */
-import { BOOK_OUTLINE_FILE, CARD_TYPES, cardPath, volumeOutlinePath, WORLD_FILE } from '../novel/paths.ts'
+import { BOOK_OUTLINE_FILE, CARD_LABELS, CARD_TYPES, cardPath, volumeOutlinePath, WORLD_FILE } from '../novel/paths.ts'
+import { cardHasField, liveCards, type CardField } from '../novel/cards.ts'
 import type { CardSummary, ChapterSummary, VolumeSummary } from '../novel/project.ts'
 import { RULE_LABELS, type CheckReport } from '../novel/checks.ts'
 import { countWords } from '../novel/words.ts'
@@ -321,6 +322,40 @@ const OUTPUT_RULES = [
 ]
 
 /**
+ * The card's own facts, as one line for a prompt.
+ *
+ * Until C1 an assembled card block carried **only the body**: a card's `role`,
+ * `age`, `gender`, aliases and tags never reached the model, so a field the
+ * author filled in was a field nobody read (the panel did not even offer a box
+ * for `age`). Those are content, not machine bookkeeping — P1's rule that ran
+ * frontmatter out of prompts was aimed at `id`/`type`/`archived`/`wordCount`, and
+ * it took the author's facts out along with the plumbing.
+ *
+ * Empty fields are dropped rather than printed blank: an unfilled field must not
+ * be fed to the model as if it were a fact.
+ *
+ * Which fields exist is a question for the card's **type** (`novel/cards.ts`
+ * `CARD_FIELDS`, format §4.3), not for the frontmatter: a 地点卡 that happens to
+ * carry `age: 300年` was written by hand (or by the panel before the form stopped
+ * offering the box), and 「年龄: 300年」 in a prompt about a town is a fact the
+ * model will use wrongly. The panel and this line read the same table.
+ * @param card - the card summary, which is what the panel already has.
+ * @returns one `｜`-joined line, or an empty string when there is nothing to say.
+ */
+export function cardFacts(card: CardSummary): string {
+  const owns = (field: CardField): boolean => cardHasField(card.type, field)
+  const parts = [
+    card.name === card.id ? '' : `名字: ${card.name}`,
+    card.aliases.length === 0 ? '' : `别名: ${card.aliases.join('、')}`,
+    card.role === undefined || !owns('role') ? '' : `身份: ${card.role}`,
+    card.age === undefined || !owns('age') ? '' : `年龄: ${card.age}`,
+    card.gender === undefined || !owns('gender') ? '' : `性别: ${card.gender}`,
+    card.tags.length === 0 ? '' : `标签: ${card.tags.join('、')}`,
+  ].filter(part => part !== '')
+  return parts.join('｜')
+}
+
+/**
  * Render the given card ids as `id — name` blocks with their bodies.
  *
  * A chapter names card ids; those ids are what the model has to keep straight,
@@ -351,7 +386,12 @@ async function cardBlocks(
       if (text === undefined) continue
       inputs.push({ path, reason: `出场设定卡：${id}` })
       const body = bodyOnly(text).trim()
-      blocks.push(`## ${id}${body === '' ? '' : `\n${body}`}`)
+      const summary = (ctx.cards ?? []).find(card => card.id === id)
+      const facts = summary === undefined ? '' : cardFacts(summary)
+      const sections = [`## ${id}`]
+      if (facts !== '') sections.push(facts)
+      if (body !== '') sections.push(body)
+      blocks.push(sections.join('\n'))
       break
     }
   }
@@ -619,10 +659,7 @@ const wholeChapterTask: TaskDefinition = {
     const { header, voice, volume } = await assembleCommon(ctx, inputs)
     const book = await include(ctx, BOOK_OUTLINE_FILE, '全书主线', inputs) ?? ''
     const beats = beatsOf(chapter)
-    const ids = [...listField(chapter.data, 'characters')]
-    const pov = chapter.data.pov
-    if (typeof pov === 'string' && pov !== '') ids.unshift(pov)
-    const cards = await cardBlocks(ctx, ids, inputs)
+    const cards = await cardBlocks(ctx, chapterWritingIds(chapter), inputs)
     const previous = await previousChapterBlock(ctx, chapter, inputs)
     const target = targetOf(chapter) ?? 3000
     const existing = chapter.body.trim()
@@ -631,7 +668,7 @@ const wholeChapterTask: TaskDefinition = {
       book.trim() === '' ? '' : `【全书主线】\n${book.trim()}`,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
-      cards.length === 0 ? '' : `【出场角色设定】\n${cards.join('\n\n')}`,
+      cards.length === 0 ? '' : `【本章相关设定】\n${cards.join('\n\n')}`,
       previous ?? '',
       existing === '' ? '' : `【已有正文（未完成，请在此基础上写完整章）】\n${tail(existing, 2000)}`,
       [
@@ -776,9 +813,10 @@ const chapterPlanTask: TaskDefinition = {
         '【要求】',
         '- 只输出一个 JSON 数组，不要解释、不要代码块围栏、不要 Markdown。',
         '- 每个元素形如：',
-        '  {"title":"第 N 章 章名","beats":["要点1","要点2"],"characters":["角色id"],"locations":["地点id"],"summary":"一句话概要","targetWords":3000}',
+        '  {"title":"第 N 章 章名","beats":["要点1","要点2"],"characters":["角色id"],"locations":["地点id"],"refs":["设定id"],"summary":"一句话概要","targetWords":3000}',
         '- 从【已有章节】之后接着往下排，章号连续，不要重复已有的章。',
-        '- characters/locations 只能使用【可用设定 id】里出现过的 id；没有合适的就留空数组。',
+        '- characters/locations/refs 只能使用【可用设定 id】里出现过的 id；没有合适的就留空数组。',
+        '- refs 放这一章真正要依据的世界设定（境界阶梯、体系规则…），一章 0–2 条就够。',
         '- 每章 2–4 条 beats，每条一句话，写清这一章要发生什么。',
       ].join('\n'),
     ].filter(section => section !== '').join('\n\n')
@@ -794,12 +832,36 @@ const chapterPlanTask: TaskDefinition = {
 }
 
 /**
+ * The card ids one chapter is **written** against, point of view first.
+ *
+ * The point of view, the characters it stages, and the generic setting cards it
+ * references (`refs`, format §3.2). `locations` is deliberately not here: the
+ * writing task has never been given them, and `refs` is the field that exists for
+ * "this chapter turns on this piece of worldbuilding" — so a location a scene
+ * genuinely needs can be referenced there on purpose rather than swept in by
+ * every chapter that mentions it. The consistency check does read locations
+ * ({@link chapterCardIds}), because there it is the *wording* that must match.
+ * @param chapter - the chapter being written.
+ * @returns distinct card ids, in the order they should be read.
+ */
+function chapterWritingIds(chapter: LoadedChapter): string[] {
+  const ids = [...listField(chapter.data, 'characters'), ...listField(chapter.data, 'refs')]
+  const pov = chapter.data.pov
+  if (typeof pov === 'string' && pov !== '') ids.unshift(pov)
+  return [...new Set(ids)]
+}
+
+/**
  * The card ids one chapter names, point of view first.
  * @param chapter - the chapter being checked.
  * @returns distinct card ids, in the order they should be read.
  */
 function chapterCardIds(chapter: LoadedChapter): string[] {
-  const ids = [...listField(chapter.data, 'characters'), ...listField(chapter.data, 'locations')]
+  const ids = [
+    ...listField(chapter.data, 'characters'),
+    ...listField(chapter.data, 'locations'),
+    ...listField(chapter.data, 'refs'),
+  ]
   const pov = chapter.data.pov
   if (typeof pov === 'string' && pov !== '') ids.unshift(pov)
   return [...new Set(ids)]
@@ -906,15 +968,23 @@ const chapterCheckTask: TaskDefinition = {
 }
 
 /**
- * Render the loaded cards as `id — 名字` lines for a planning prompt.
+ * Render the loaded cards as `类型 — id — 名字` lines for a planning prompt.
+ *
+ * The type is the panel's own label rather than the raw `type:` value, because
+ * the model uses these lines to choose `refs` as well as `characters`: 「设定:
+ * jian-xiu — 剑修境界」 says what the card is, `lore:` says nothing.
  * @param ctx - task context.
  * @returns the rendered list, or an empty string when no cards were loaded.
  */
 function renderCast(ctx: TaskContext): string {
-  const cards = (ctx.cards ?? []).filter(card => !card.archived)
+  // A retired card is not material a prompt should offer: deleted cards are out
+  // (P2), and so is a thread the author abandoned — a dropped line is not
+  // something a new chapter should weave in. Same predicate the checks and the
+  // panel use (`novel/cards.ts`).
+  const cards = liveCards(ctx.cards ?? [])
   if (cards.length === 0) return ''
   return cards
-    .map(card => `${card.type === 'thread' ? '伏笔' : card.type}: ${card.id} — ${card.name}`)
+    .map(card => `${CARD_LABELS[card.type]}: ${card.id} — ${card.name}`)
     .join('\n')
 }
 

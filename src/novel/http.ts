@@ -15,6 +15,7 @@
  * @module dsh-ai-novel-copilot/novel/http
  */
 import { diffLines, type HistorySource } from './history.ts'
+import type { ExportFormat, ExportRequest, ExportScope } from './book-export.ts'
 import {
   NovelError,
   type LoadedChapter,
@@ -39,6 +40,8 @@ export const ROUTE_SEARCH = '/api/novel/search'
 export const ROUTE_CHECKS = '/api/novel/checks'
 /** M7's modification record: list versions, read one, roll back to one. */
 export const ROUTE_HISTORY = '/api/novel/history'
+/** P5's export: render the book as md/txt, and optionally write it to `exports/`. */
+export const ROUTE_EXPORT = '/api/novel/export'
 export const ROUTE_TEXT = '/api/novel/text'
 export const ROUTE_META = '/api/novel/meta'
 export const ROUTE_RUN = '/api/novel/run'
@@ -55,6 +58,7 @@ export const NOVEL_ROUTES = [
   ROUTE_SEARCH,
   ROUTE_CHECKS,
   ROUTE_HISTORY,
+  ROUTE_EXPORT,
   ROUTE_TEXT,
   ROUTE_META,
   ROUTE_RUN,
@@ -167,6 +171,51 @@ function optionalCount(url: URL, name: string): number | undefined {
   if (raw === null || raw === '') return undefined
   const value = Number(raw)
   return Number.isInteger(value) && value > 0 ? value : undefined
+}
+
+/**
+ * Read an export specification out of a JSON body or a query string.
+ *
+ * Both carriers arrive here as `unknown` per field and are narrowed the same
+ * way, so `GET ?scope=volume&volume=2` and `POST {scope:'volume', volume:2}`
+ * cannot disagree about what they mean. Any unrecognised value falls back to the
+ * harmless reading (the whole book, Markdown) rather than failing: a wrong
+ * export the author can see is better than a button that does nothing, and the
+ * scope-specific requirements below are the only ones that must be explicit.
+ * @param raw - the raw fields, from either carrier.
+ * @param allowHead - whether a truncated rendering may be asked for. True for the
+ *   read (a preview), **false for the write**: a `head` on the write path would
+ *   put a truncated manuscript on disk under a name that claims to be the book.
+ * @returns the specification to render.
+ * @throws {NovelError} `novel/bad-request` when a narrowed scope is missing its selection.
+ */
+function exportSpecOf(raw: Record<string, unknown>, allowHead: boolean): ExportRequest {
+  const format: ExportFormat = raw.format === 'txt' ? 'txt' : 'md'
+  const scope: ExportScope = raw.scope === 'volume' || raw.scope === 'chapter' ? raw.scope : 'book'
+  const head = allowHead ? optionalCountOf(raw.head) : undefined
+  const withHead = head === undefined ? {} : { head }
+  if (scope === 'chapter') {
+    const path = typeof raw.path === 'string' ? raw.path : ''
+    if (path === '') throw new NovelError('novel/bad-request', '导出单章需要 path（要导出哪一章）')
+    return { format, scope, path, ...withHead }
+  }
+  if (scope === 'volume') {
+    const volume = typeof raw.volume === 'number' ? raw.volume : Number(raw.volume)
+    if (!Number.isFinite(volume)) throw new NovelError('novel/bad-request', '导出某一卷需要 volume（第几卷）')
+    return { format, scope, volume, ...withHead }
+  }
+  return { format, scope, ...withHead }
+}
+
+/**
+ * Read an optional positive integer out of either carrier.
+ * @param value - the raw field.
+ * @returns the number, or undefined when it is not a usable count.
+ */
+function optionalCountOf(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : undefined
 }
 
 /** Parse a JSON request body. */
@@ -292,14 +341,17 @@ export function createHandlers(deps: HandlerDeps): NovelHandlers {
           title: typeof raw.title === 'string' && raw.title !== '' ? raw.title : '新章节',
         }
         // A plan hands over the outline it just produced: beats per chapter, the
-        // characters the outline named, and a summary — all of them optional,
-        // so each is copied only when the caller actually sent one.
+        // characters the outline named, the setting cards it is written against,
+        // and a summary — all of them optional, so each is copied only when the
+        // caller actually sent one.
         const beats = stringArray(raw.beats)
         if (beats !== undefined) spec.beats = beats
         const characters = stringArray(raw.characters)
         if (characters !== undefined) spec.characters = characters
         const locations = stringArray(raw.locations)
         if (locations !== undefined) spec.locations = locations
+        const refs = stringArray(raw.refs)
+        if (refs !== undefined) spec.refs = refs
         if (typeof raw.summary === 'string') spec.summary = raw.summary
         if (typeof raw.pov === 'string' && raw.pov !== '') spec.pov = raw.pov
         if (typeof raw.number === 'number' && Number.isFinite(raw.number)) spec.number = raw.number
@@ -502,6 +554,41 @@ export function createHandlers(deps: HandlerDeps): NovelHandlers {
     }
   }
 
+  /**
+   * P5's export channel.
+   *
+   * A `GET` renders and answers with the text — that is both the preview and the
+   * bytes a browser download needs — and a `POST` writes the same rendering to
+   * `exports/`. Rendering is on the host because the book is: the panel has only
+   * the tree, and an export needs every chapter's prose in reading order.
+   */
+  const exportRoute = async (request: Request): Promise<Response> => {
+    try {
+      if (request.method === 'GET' || request.method === 'HEAD') {
+        const url = new URL(request.url)
+        const scope = scopeOf(url)
+        const plan = await io.exportBook(scope, exportSpecOf({
+          format: url.searchParams.get('format') ?? undefined,
+          scope: url.searchParams.get('scope') ?? undefined,
+          volume: url.searchParams.get('volume') ?? undefined,
+          path: url.searchParams.get('path') ?? undefined,
+          head: url.searchParams.get('head') ?? undefined,
+        }, true))
+        if (request.method === 'HEAD') return new Response(null, { status: 200 })
+        return json(200, { ok: true, ...plan })
+      }
+      const body = await readJson(request)
+      const scope: NovelScope = {
+        root: requireField(body, 'root'),
+        sessionId: requireField(body, 'sessionId'),
+      }
+      const written = await io.saveExport(scope, exportSpecOf(body, false))
+      return json(200, { ok: true, ...written })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
   const run = async (request: Request): Promise<Response> => {
     try {
       if (request.method !== 'POST') return failure(405, 'novel/method', '任务记录只接受 POST')
@@ -599,6 +686,7 @@ export function createHandlers(deps: HandlerDeps): NovelHandlers {
     [ROUTE_SEARCH]: search,
     [ROUTE_CHECKS]: checks,
     [ROUTE_HISTORY]: history,
+    [ROUTE_EXPORT]: exportRoute,
     [ROUTE_TEXT]: text,
     [ROUTE_META]: meta,
     [ROUTE_RUN]: run,

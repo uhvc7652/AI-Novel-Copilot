@@ -14,9 +14,12 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuoteLocate } from './locate.ts'
+import { ListField } from './ListField.tsx'
+import { TimelineEditor } from './TimelineEditor.tsx'
 import type { SettingsLibrary, SettingsPage } from '../novel/io.ts'
 import type { CardSummary, CardType, ChapterSummary } from '../novel/project.ts'
-import { CARD_TYPES, WORLD_FILE } from '../novel/paths.ts'
+import { cardBodyHint, cardHasField, roleLabels, roleValue, type CardField } from '../novel/cards.ts'
+import { CARD_LABELS, CARD_TYPES, cardTypeOfPath, TIMELINE_FILE, WORLD_FILE } from '../novel/paths.ts'
 import * as api from './api.ts'
 import {
   box,
@@ -57,6 +60,11 @@ export interface SettingsViewProps {
   active: boolean
   /** Bumped by the panel when this editor should re-read the card it has open. */
   refreshToken?: number
+  /**
+   * Bumped by the panel when `Ctrl+S` (or the footer's 保存) means *this*
+   * surface's document rather than the chapter.
+   */
+  saveToken?: number
   /** Tell the panel which document this surface has open, so M7's record view follows it. */
   onOpenDocument?(path: string, surface: 'settings', dirty: boolean): void
   /** A passage to select in the card body, from a finding or a diff line. */
@@ -82,23 +90,45 @@ function field(data: Record<string, unknown>, key: string): string {
   return ''
 }
 
-/** Render a list field as a comma-separated string. */
-function listText(data: Record<string, unknown>, key: string): string {
+/**
+ * Read a list field as labels, tolerating a bare scalar.
+ *
+ * `listText` used to be the same thing joined for display, which is what made the
+ * comma impossible to type: the input's value *was* the parsed list, so the round
+ * trip ate the separator. The parsing now happens when the author leaves the
+ * field (`ListField`), and the raw value only has to answer "what are the labels".
+ * @param data - frontmatter data.
+ * @param key - field name.
+ * @returns the labels.
+ */
+function listOf(data: Record<string, unknown>, key: string): string[] {
   const value = data[key]
-  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string').join(', ')
-  return typeof value === 'string' ? value : ''
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string')
+  return typeof value === 'string' && value.trim() !== '' ? [value] : []
 }
 
-/** Split a comma-separated field back into a list. */
-function toList(text: string): string[] {
-  return text.split(/[,，]/).map(entry => entry.trim()).filter(entry => entry !== '')
+/**
+ * What each single-file page is for, shown where its form would otherwise be
+ * indistinguishable from a card's.
+ *
+ * The two pages are not cards and have nothing in common with each other either:
+ * the world overview is prose that **only 一致性检查（模型）** reads, whole, as the
+ * thing a chapter is checked against, and the timeline is a **table** the
+ * consistency checks read (`07` §1.1's `timeline-ref` / `timeline-order`).
+ * Saying so on the page is the cheapest half of giving the timeline its own
+ * editor — and of keeping detail (a cultivation ladder, a magic system) out of
+ * the one file every model check has to carry.
+ */
+const PAGE_HINT: Record<string, string> = {
+  [WORLD_FILE]: '世界观：整本书的设定总纲，散文。只有「一致性检查（模型）」会整份读它；写正文用的是本卷卷纲与本章 frontmatter 引用的设定卡——细则（境界阶梯、体系规则、术语）开一张「设定」卡更合适，这里只留总纲与不可违背的那几条。',
+  [TIMELINE_FILE]: '时间线：一张表，四列是 叙事序 / 故事时间 / 事件 / 章节 id。「检查」按这张表报倒序（timeline-order）和引用不存在的章（timeline-ref）。',
 }
 
 /**
  * The settings view.
  * @param props - environment, the loaded library, and the reload hook.
  */
-export function SettingsView({ env, library, chapters, onReload, onOpenChapter, focus, active, refreshToken, onOpenDocument, locate }: SettingsViewProps) {
+export function SettingsView({ env, library, chapters, onReload, onOpenChapter, focus, active, refreshToken, saveToken, onOpenDocument, locate }: SettingsViewProps) {
   const [open, setOpen] = useState<OpenCard>()
   const [showArchived, setShowArchived] = useState(false)
   const [draft, setDraft] = useState<{ type: CardType, id: string, name: string }>({
@@ -216,6 +246,15 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
     setOpen(previous => (previous === undefined ? previous : { ...previous, data: { ...previous.data, ...next } }))
   }, [])
 
+  /**
+   * The current save action, for a retry to re-enter.
+   *
+   * A failed save keeps a retry in the status line, and re-running the closure
+   * that failed would write the card as it was at that moment — so the retry
+   * goes back through this ref, which always holds the newest `onSave`.
+   */
+  const onSaveRef = useRef<(() => void) | undefined>(undefined)
+
   /** Write the open card through the ordinary document path. */
   const onSave = useCallback(() => {
     if (open === undefined) return
@@ -223,9 +262,30 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
       const written = await api.writeDocument(env.sessionId, env.root, open.path, open.data, open.body)
       setOpen({ ...open, original: { data: { ...open.data }, body: open.body }, exists: true })
       await onReload()
-      return `已保存 ${open.path}（${written.operation === 'create' ? '新建' : '覆盖'}）`
-    })
+      const warning = written.warning === undefined ? '' : `｜注意：${written.warning}`
+      return `已保存 ${open.path}（${written.operation === 'create' ? '新建' : '覆盖'}）${warning}`
+    }, () => { onSaveRef.current?.() })
   }, [env, onReload, open])
+  onSaveRef.current = onSave
+
+  /**
+   * Save the open card when the panel asks for it.
+   *
+   * The token is compared against the value this editor last saw, so a re-render
+   * never re-saves — only a new bump does. Writing an unchanged card is harmless
+   * (the host records no version for identical text), but a 保存 that fired on
+   * its own would be a horror.
+   */
+  const saveSeen = useRef(saveToken)
+  useEffect(() => {
+    if (saveToken === undefined || saveToken === saveSeen.current) return
+    saveSeen.current = saveToken
+    if (open === undefined) {
+      env.note('设定页里没有打开的卡——先在左边点一张')
+      return
+    }
+    onSave()
+  }, [env, onSave, open, saveToken])
 
   /** Archive or restore the open card. */
   const onToggleArchive = useCallback(() => {
@@ -268,8 +328,40 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
 
   const dirty = open !== undefined
     && (open.body !== open.original.body || JSON.stringify(open.data) !== JSON.stringify(open.original.data))
-  const isThread = open !== undefined && field(open.data, 'type') === 'thread'
-  const isPage = open !== undefined && (open.path === WORLD_FILE || open.path.endsWith('timeline.md'))
+  /**
+   * The open card's type, taken from its **directory** rather than its `type:`
+   * line.
+   *
+   * `paths.ts` is explicit that a card's type is its directory (`cardTypeOfPath`,
+   * the same reader the host's scan uses), so a file whose frontmatter says
+   * `type: character` inside `settings/locations/` is a location here and in the
+   * checks — one answer, not two. The form used to ask the frontmatter instead,
+   * which meant a thread card missing its `type:` line got the character form.
+   */
+  const openType = open === undefined ? undefined : cardTypeOfPath(open.path)
+  const isThread = openType === 'thread'
+  const isPage = open !== undefined && (open.path === WORLD_FILE || open.path === TIMELINE_FILE)
+  const isTimeline = open !== undefined && open.path === TIMELINE_FILE
+  /**
+   * Which optional fields this card's type actually has (format §4.3).
+   *
+   * Every card used to be rendered with the character form: 身份 / 年龄 / 性别 on a
+   * 地点卡 too, and the same body-section hint for all of them, which is what the
+   * author saw as 「地点、物品的编辑界面和角色卡的一样」. The table is in
+   * `novel/cards.ts`, next to the other card rules, because `cardFacts` asks it
+   * the same question when it builds a prompt.
+   */
+  const owns = (cardField: CardField): boolean => openType !== undefined && cardHasField(openType, cardField)
+  /**
+   * The label a document's own title field carries.
+   *
+   * A **thread** card calls it `title` (format §4.4) and a **single-file page**
+   * does too (§4.5's timeline, and the world overview), while every other card
+   * calls it `name`. The form used to bind `name` for pages as well, so opening
+   * 世界观 or 时间线 showed an empty box that wrote a field nothing reads —
+   * which is exactly what the author hit: "两个页面的编辑方式是一样的".
+   */
+  const titleField = isThread || isPage ? 'title' : 'name'
   const appearsIn = open === undefined || isPage ? [] : findAppearsIn(library, open.path)
   const referenced = appearsIn
     .map(id => chapterById.get(id))
@@ -351,7 +443,7 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
           value={draft.type}
           onChange={event => { setDraft({ ...draft, type: event.target.value as CardType }) }}
         >
-          {CARD_TYPES.map(type => <option key={type} value={type}>{type}</option>)}
+          {CARD_TYPES.map(type => <option key={type} value={type}>{CARD_LABELS[type]}</option>)}
         </select>
         <input
           style={{ ...input, width: 140 }}
@@ -376,64 +468,139 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
           <div style={row}>
             <input
               style={{ ...input, flex: '1 1 120px' }}
-              value={isThread ? field(open.data, 'title') : field(open.data, 'name')}
-              placeholder={isThread ? '伏笔标题' : '名字'}
-              onChange={event => {
-                patch(isThread ? { title: event.target.value } : { name: event.target.value })
-              }}
+              value={field(open.data, titleField)}
+              placeholder={isPage ? '这一页的标题' : isThread ? '伏笔标题' : '名字'}
+              onChange={event => { patch({ [titleField]: event.target.value }) }}
             />
-            <input
-              style={{ ...input, width: 120 }}
-              value={field(open.data, 'id')}
-              placeholder="id"
-              disabled
-            />
-            <input
-              style={{ ...input, width: 150 }}
-              value={listText(open.data, 'aliases')}
-              placeholder="别名（逗号分隔）"
-              onChange={event => { patch({ aliases: toList(event.target.value) }) }}
-            />
-          </div>
-          <div style={row}>
-            <input
-              style={{ ...input, width: 130 }}
-              value={field(open.data, 'role')}
-              placeholder="身份/立场"
-              onChange={event => { patch({ role: event.target.value }) }}
-            />
-            <input
-              style={{ ...input, flex: '1 1 120px' }}
-              value={listText(open.data, 'tags')}
-              placeholder="标签（逗号分隔）"
-              onChange={event => { patch({ tags: toList(event.target.value) }) }}
-            />
-            {isThread && (
-              <select
-                style={input}
-                value={field(open.data, 'status') === '' ? 'planted' : field(open.data, 'status')}
-                onChange={event => { patch({ status: event.target.value }) }}
-              >
-                {Object.entries(THREAD_STATUS_LABEL).map(([value, label]) => (
-                  <option key={value} value={value}>{label}</option>
-                ))}
-              </select>
+            {!isPage && (
+              <>
+                <input
+                  style={{ ...input, width: 120 }}
+                  value={field(open.data, 'id')}
+                  placeholder="id"
+                  disabled
+                />
+                <ListField
+                  style={{ ...input, width: 150 }}
+                  value={listOf(open.data, 'aliases')}
+                  placeholder="别名（逗号分隔）"
+                  onChange={labels => { patch({ aliases: labels }) }}
+                />
+              </>
             )}
-            <label style={checkLine}>
-              <input
-                type="checkbox"
-                checked={open.data.archived === true}
-                onChange={event => { patch({ archived: event.target.checked }) }}
-              /> 已存档
-            </label>
           </div>
-          <textarea
-            ref={bodyRef}
-            style={textarea}
-            value={open.body}
-            placeholder={isPage ? '正文' : '卡片的正文分节：外貌 / 性格 / 能力 / 动机 / 硬约束'}
-            onChange={event => { setOpen({ ...open, body: event.target.value }) }}
-          />
+          {/* A single-file page has no id, no aliases and nothing to archive: its
+              whole shape is `type` + `title` + prose. Showing the card fields here
+              was the other half of "两个页面看起来一模一样". */}
+          {isPage
+            ? <div style={metaLine}>{PAGE_HINT[open.path] ?? ''}</div>
+            : (
+              <div style={row}>
+                {/* 身份：角色卡的 `role` 与势力卡的「立场」是格式里的同一个字段
+                    （`CARD_FIELDS`）。地点与物品没有这个字段，所以这里不给框。 */}
+                {owns('role') && (
+                  <ListField
+                    style={{ ...input, width: 130 }}
+                    value={roleLabels(open.data.role)}
+                    placeholder={openType === 'faction' ? '立场（逗号分隔）' : '身份（逗号分隔）'}
+                    title="可以写多个，例如 主角, 前朝皇子"
+                    onChange={labels => {
+                      const written = roleValue(labels)
+                      // No labels means no key, not `role: ""`.
+                      patch({ role: written === '' ? undefined : written })
+                    }}
+                  />
+                )}
+                {owns('age') && (
+                  <input
+                    style={{ ...input, width: 110 }}
+                    value={field(open.data, 'age')}
+                    placeholder="年龄"
+                    inputMode="numeric"
+                    onChange={event => {
+                      const text = event.target.value.trim()
+                      if (text === '') {
+                        // Clearing the box deletes the key rather than leaving a
+                        // null-ish value the author never typed.
+                        patch({ age: undefined })
+                        return
+                      }
+                      // A number when it is one, otherwise the author's own words:
+                      // `age: 19岁` beats `age: NaN`, which is what a naive
+                      // `Number(text)` would have written into the YAML.
+                      const value = Number(text)
+                      patch({ age: Number.isFinite(value) ? value : text })
+                    }}
+                  />
+                )}
+                {owns('gender') && (
+                  <>
+                    <input
+                      style={{ ...input, width: 90 }}
+                      value={field(open.data, 'gender')}
+                      placeholder="性别"
+                      list="novel-card-genders"
+                      onChange={event => { patch({ gender: event.target.value }) }}
+                    />
+                    <datalist id="novel-card-genders">
+                      <option value="男" />
+                      <option value="女" />
+                      <option value="其他" />
+                    </datalist>
+                  </>
+                )}
+                <ListField
+                  style={{ ...input, flex: '1 1 120px' }}
+                  value={listOf(open.data, 'tags')}
+                  placeholder="标签（逗号分隔）"
+                  onChange={labels => { patch({ tags: labels }) }}
+                />
+                {isThread && (
+                  <select
+                    style={input}
+                    value={field(open.data, 'status') === '' ? 'planted' : field(open.data, 'status')}
+                    onChange={event => { patch({ status: event.target.value }) }}
+                  >
+                    {Object.entries(THREAD_STATUS_LABEL).map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                )}
+                <label style={checkLine}>
+                  <input
+                    type="checkbox"
+                    checked={open.data.archived === true}
+                    onChange={event => { patch({ archived: event.target.checked }) }}
+                  /> 已存档
+                </label>
+              </div>
+            )}
+          {/* The timeline is a **table**, the world overview is prose, cards are
+              sections — three shapes, so one shared textarea for all of them was
+              the wrong default. The timeline gets rows (and 编辑原文 as the way
+              out); everything else keeps the editor that suits prose. */}
+          {isTimeline
+            ? (
+              <TimelineEditor
+                env={env}
+                body={open.body}
+                chapters={chapters}
+                onChange={body => {
+                  setOpen(previous => (previous === undefined ? previous : { ...previous, body }))
+                }}
+                {...(locate === undefined ? {} : { locate })}
+                textareaRef={bodyRef}
+              />
+            )
+            : (
+              <textarea
+                ref={bodyRef}
+                style={textarea}
+                value={open.body}
+                placeholder={isPage ? '正文' : `卡片的正文分节：${openType === undefined ? '' : cardBodyHint(openType)}`}
+                onChange={event => { setOpen({ ...open, body: event.target.value }) }}
+              />
+            )}
           <div style={{ ...row, justifyContent: 'space-between' }}>
             <span style={{ ...row, fontSize: 11 }}>
               <span style={caption}>
