@@ -33,7 +33,7 @@ src/client/index.tsx      __views 多导出 ModelIssueList（渲染检查用）
 | `novel.yaml`（渲染成一行） | 书名/体裁，模型的语气与定位 |
 | `settings/world.md` | **硬约束**在这一节，M6 要查的「不可违背」都在这 |
 | `outline/volumes/vNN.md` | 本卷目标：这一段该发生什么 |
-| 本章登记的卡（`pov`/`characters`/`locations`，最多 6 张） | 事实的另一边 |
+| 本章登记的卡（`pov`/`characters`/`locations`；上限 6 张已在 2026-09-15 取消，见 `00` v0.37） | 事实的另一边 |
 | 上一章的摘要与结尾 | 衔接类的矛盾只有看到它才可能被发现 |
 | 本章 frontmatter（要点/摘要/登记的卡） | 章纲与实际写成什么的对齐 |
 | 本章正文 | 被检查的对象 |

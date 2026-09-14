@@ -137,9 +137,6 @@ function liveChapters(volumes: readonly VolumeSummary[]): ChapterSummary[] {
   return volumes.flatMap(volume => volume.chapters).filter(chapter => !chapter.archived)
 }
 
-/** How many setting cards a single prompt may carry. */
-const MAX_CARDS = 6
-
 /** How many style samples a single prompt may carry. */
 const MAX_SAMPLES = 3
 
@@ -278,11 +275,12 @@ async function includeSamples(ctx: TaskContext, inputs: TaskInput[]): Promise<st
   return samples
 }
 
-/** The shared preamble every prose task needs: book, chapter, beats, voice. */
-async function assembleCommon(ctx: TaskContext, inputs: TaskInput[]): Promise<{
+/** The shared preamble every prose task needs: book, chapter, beats, voice, cards. */
+async function assembleCommon(ctx: TaskContext, inputs: TaskInput[], withCards = true): Promise<{
   header: string
   voice: string
   volume: string
+  settings: string
 }> {
   const voice = await include(ctx, 'style/style-guide.md', '文风规则', inputs) ?? ''
   const samples = await includeSamples(ctx, inputs)
@@ -312,7 +310,17 @@ async function assembleCommon(ctx: TaskContext, inputs: TaskInput[]): Promise<{
   const withSamples = samples.length === 0
     ? voice
     : `${voice}${voice.trim() === '' ? '' : '\n\n'}【风格样本（照着这个语感写）】\n${samples.join('\n\n')}`
-  return { header: lines.join('\n\n'), voice: withSamples, volume }
+  // The setting cards this chapter is written against — the ones the author
+  // attached to it, whatever their type. Rendered here rather than in each task
+  // because 续写 / 改写 / 扩写 / 润色 / 整章 all need exactly the same material:
+  // a card the panel let the author attach and the task then forgot would be a
+  // reference that only exists on screen. `withCards` is false for the style
+  // check, which is about voice and would only carry noise — and whose input list
+  // must not name a file its prompt does not contain.
+  const settings = !withCards || ctx.chapter === undefined
+    ? ''
+    : (await cardBlocks(ctx, chapterWritingIds(ctx.chapter), inputs)).join('\n\n')
+  return { header: lines.join('\n\n'), voice: withSamples, volume, settings }
 }
 
 /** Rules every prose task shares, so the output stays paste-ready. */
@@ -373,7 +381,13 @@ async function cardBlocks(
   inputs: TaskInput[],
 ): Promise<string[]> {
   const blocks: string[] = []
-  const wanted = [...new Set(ids)].slice(0, MAX_CARDS)
+  // **Every** card the chapter references, with no cap. There used to be one (six),
+  // and it silently dropped the rest: a card the author attached by hand and the
+  // model never saw is the same lie as a panel row that shows a card the prompt
+  // does not contain. References are an authorial decision, not a heuristic the
+  // assembler gets to trim — if a chapter's cards make the prompt long, that is
+  // the author's call to make, and the input list (`inputs`) shows them all.
+  const wanted = [...new Set(ids)]
   for (const id of wanted) {
     for (const type of CARD_TYPES) {
       const path = cardPath(type, id)
@@ -446,7 +460,7 @@ const continueTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice, volume } = await assembleCommon(ctx, inputs)
+    const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const body = chapter.body.trim()
     const written = tail(body, 1500)
     // Say which it is: a short chapter goes in whole, and calling a four-word
@@ -457,6 +471,7 @@ const continueTask: TaskDefinition = {
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
+      settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
       written === ''
         ? '【已写正文】（本章尚无正文，请从头写起）'
         : truncated ? `【已写正文（结尾部分）】\n${written}` : `【已写正文】\n${written}`,
@@ -477,12 +492,13 @@ const rewriteTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice, volume } = await assembleCommon(ctx, inputs)
+    const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const target = targetOf(chapter)
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
+      settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -506,12 +522,13 @@ const expandTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice, volume } = await assembleCommon(ctx, inputs)
+    const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const target = targetOf(chapter) ?? Math.max(1000, countWords(chapter.body))
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
+      settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -544,12 +561,13 @@ const polishTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice, volume } = await assembleCommon(ctx, inputs)
+    const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const target = targetOf(chapter)
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则与样本】\n${voice.trim()}`,
+      settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -604,7 +622,7 @@ const styleCheckTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice } = await assembleCommon(ctx, inputs)
+    const { header, voice } = await assembleCommon(ctx, inputs, false)
     const body = chapter.body.trim()
     const prompt = [
       header,
@@ -656,10 +674,9 @@ const wholeChapterTask: TaskDefinition = {
   async build(ctx) {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
-    const { header, voice, volume } = await assembleCommon(ctx, inputs)
+    const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const book = await include(ctx, BOOK_OUTLINE_FILE, '全书主线', inputs) ?? ''
     const beats = beatsOf(chapter)
-    const cards = await cardBlocks(ctx, chapterWritingIds(chapter), inputs)
     const previous = await previousChapterBlock(ctx, chapter, inputs)
     const target = targetOf(chapter) ?? 3000
     const existing = chapter.body.trim()
@@ -668,7 +685,7 @@ const wholeChapterTask: TaskDefinition = {
       book.trim() === '' ? '' : `【全书主线】\n${book.trim()}`,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
-      cards.length === 0 ? '' : `【本章相关设定】\n${cards.join('\n\n')}`,
+      settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
       previous ?? '',
       existing === '' ? '' : `【已有正文（未完成，请在此基础上写完整章）】\n${tail(existing, 2000)}`,
       [
@@ -834,18 +851,21 @@ const chapterPlanTask: TaskDefinition = {
 /**
  * The card ids one chapter is **written** against, point of view first.
  *
- * The point of view, the characters it stages, and the generic setting cards it
- * references (`refs`, format §3.2). `locations` is deliberately not here: the
- * writing task has never been given them, and `refs` is the field that exists for
- * "this chapter turns on this piece of worldbuilding" — so a location a scene
- * genuinely needs can be referenced there on purpose rather than swept in by
- * every chapter that mentions it. The consistency check does read locations
- * ({@link chapterCardIds}), because there it is the *wording* that must match.
+ * Every reference field the chapter has: the point of view, the characters it
+ * stages, the locations it uses, and the generic setting cards it is written
+ * against (`refs`, format §3.2). The panel's card picker writes into these same
+ * three fields (routed by card type, `chapterRefFieldOf`), so "I attached this
+ * card to this chapter" and "the model was given it" are the same statement:
+ * **all** of them travel, with no cap (see {@link cardBlocks}).
  * @param chapter - the chapter being written.
  * @returns distinct card ids, in the order they should be read.
  */
 function chapterWritingIds(chapter: LoadedChapter): string[] {
-  const ids = [...listField(chapter.data, 'characters'), ...listField(chapter.data, 'refs')]
+  const ids = [
+    ...listField(chapter.data, 'characters'),
+    ...listField(chapter.data, 'locations'),
+    ...listField(chapter.data, 'refs'),
+  ]
   const pov = chapter.data.pov
   if (typeof pov === 'string' && pov !== '') ids.unshift(pov)
   return [...new Set(ids)]

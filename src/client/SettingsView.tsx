@@ -14,6 +14,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuoteLocate } from './locate.ts'
+import { documentChanged } from '../novel/buffer.ts'
 import { ListField } from './ListField.tsx'
 import { TimelineEditor } from './TimelineEditor.tsx'
 import type { SettingsLibrary, SettingsPage } from '../novel/io.ts'
@@ -150,8 +151,7 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
   // ownership would move the modification record out from under the author.
   // `dirty` travels with it so a rollback can warn about unsaved edits to a card
   // exactly as it does for a chapter.
-  const openDirty = open !== undefined
-    && (open.body !== open.original.body || JSON.stringify(open.data) !== JSON.stringify(open.original.data))
+  const openDirty = open !== undefined && documentChanged(open, open.original)
   useEffect(() => {
     if (!active || open === undefined) return
     onOpenDocument?.(open.path, 'settings', openDirty)
@@ -326,8 +326,7 @@ export function SettingsView({ env, library, chapters, onReload, onOpenChapter, 
     })
   }, [draft, env, onReload])
 
-  const dirty = open !== undefined
-    && (open.body !== open.original.body || JSON.stringify(open.data) !== JSON.stringify(open.original.data))
+  const dirty = open !== undefined && documentChanged(open, open.original)
   /**
    * The open card's type, taken from its **directory** rather than its `type:`
    * line.

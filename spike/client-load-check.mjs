@@ -31,6 +31,46 @@ const { renderToStaticMarkup } = require('react-dom/server')
 const loaded = []
 /** Everything `apply()` did, in order. */
 const trace = []
+/** Every specifier the bundle resolved, so instance identity can be asserted. */
+const resolved = new Map()
+
+/**
+ * The shell's frozen module table, read out of the build config.
+ *
+ * `tsdown.config.ts` mirrors `PLATFORM_MODULES` from the DSH web shell, and the
+ * client artifact must ask for those and nothing else. Reading the list from the
+ * config is the point: the two cannot drift.
+ * @returns the specifiers the browser half is allowed to require.
+ */
+async function readPlatformModules() {
+  const config = await readFile(new URL('../tsdown.config.ts', import.meta.url), 'utf8')
+  const block = /const PLATFORM_MODULES = \[([\s\S]*?)\]/.exec(config)?.[1]
+  if (block === undefined) throw new Error('tsdown.config.ts has no PLATFORM_MODULES list to check against')
+  const allowed = new Set([...block.matchAll(/'([^']+)'/g)].map(match => match[1]))
+  if (!allowed.has('react')) throw new Error('the PLATFORM_MODULES list was parsed as empty')
+  return allowed
+}
+
+const PLATFORM_TABLE = await readPlatformModules()
+
+/**
+ * `require` exactly as the browser half gets it: the table answers, or it throws.
+ *
+ * Node's own `require` resolves anything in `node_modules`, which is how a
+ * host-only package rode into the bundle unnoticed — every assertion stayed green
+ * while the plugin threw at load in the browser. Failing here means failing where
+ * the author would have felt it.
+ * @param specifier - what the bundle asked for.
+ * @returns the shared module instance.
+ */
+function tableRequire(specifier) {
+  if (!PLATFORM_TABLE.has(specifier)) {
+    throw new Error(`the shell's module table cannot answer require("${specifier}") — it has to be inlined (see novel/buffer.ts, README 教训 8)`)
+  }
+  const loadedModule = require(specifier)
+  if (!resolved.has(specifier)) resolved.set(specifier, loadedModule)
+  return loadedModule
+}
 
 const code = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
 const fakeWindow = { __ModuleLoader__: { load: registration => loaded.push(registration) } }
@@ -40,7 +80,7 @@ const moduleShim = { exports: {} }
 // directly, so it is evaluated the way the browser's module table does.
 new Function('window', 'require', 'module', 'exports', code)(
   fakeWindow,
-  require,
+  tableRequire,
   moduleShim,
   moduleShim.exports,
 )
@@ -54,15 +94,7 @@ if (registration === undefined) {
 console.log(`  id: ${String(registration.id)}`)
 console.log(`  factory is a function: ${String(typeof registration.factory === 'function')}`)
 
-/** Every specifier the bundle resolved, so instance identity can be asserted. */
-const resolved = new Map()
-const bundleRequire = (specifier) => {
-  const loadedModule = require(specifier)
-  if (!resolved.has(specifier)) resolved.set(specifier, loadedModule)
-  return loadedModule
-}
-
-const face = registration.factory(bundleRequire)
+const face = registration.factory(tableRequire)
 console.log(`exports: ${Object.keys(face).join(', ')}`)
 console.log(`  boot graph module requests: ${[...resolved.keys()].join(', ')}`)
 console.log(`  react instance shared with the renderer: ${String(resolved.get('react') === require('react'))}`)
@@ -151,7 +183,9 @@ try {
     console.log(markup.slice(0, 700))
   }
   checkSurfaces(face, require('react'), renderToStaticMarkup)
+  await checkModuleTable()
   await checkDimmedControls()
+  await checkDirtyFlags()
   console.log('RESULT: PASS — bundle executes, registrations correct, every surface renders')
 } catch (error) {
   console.log(`RESULT: FAIL — render threw: ${error instanceof Error ? error.stack : String(error)}`)
@@ -317,9 +351,71 @@ function checkSurfaces(face, react, render) {
     scanned: { chapters: 1, cards: 1, pages: 1 },
   }
 
+  /**
+   * Two extra cards for the 「本章引用的卡」 row: the one the author reported
+   * missing (a new character card) and the one they did manage to attach.
+   */
+  const fangHeng = {
+    path: 'settings/characters/fang-heng.md',
+    id: 'fang-heng',
+    type: 'character',
+    name: '方衡',
+    aliases: [],
+    status: '',
+    archived: false,
+    tags: [],
+    appearsIn: [],
+    gist: '德高望重的老者',
+  }
+  const loreSetting = {
+    path: 'settings/lore/jing-jie-ling-kong.md',
+    id: 'jing-jie-ling-kong',
+    type: 'lore',
+    name: '境界-凌空',
+    aliases: [],
+    status: '',
+    archived: false,
+    tags: [],
+    appearsIn: [],
+    gist: '凌空境·他我之境',
+  }
+  /** A retired card, which the picker must keep out of the list. */
+  const archivedCard = {
+    path: 'settings/characters/lao-zhou.md',
+    id: 'lao-zhou',
+    type: 'character',
+    name: '老周',
+    aliases: [],
+    status: '',
+    archived: true,
+    tags: [],
+    appearsIn: [],
+    gist: '巡夜人',
+  }
+
   const surfaces = [
     ['Panel', { sessionId: 'spike-session', pickDirectory: async () => null }, ['选择文件夹', '打开', '初始化', '正文', '伏笔', '设定', '大纲', '检索', '检查', '修改记录', '导出', '快捷键']],
     ['SettingsView', { env, library, chapters: [chapter], active: true, onReload: async () => {}, onOpenChapter: () => {}, onOpenDocument: () => {} }, ['陈默', '新建卡', '世界观', '已存档 1 张']],
+    [
+      // 「本章引用的卡」. The author reported "I made 方衡 and it is not in 加卡"
+      // twice, so this row's contract is rendered, not inferred: **every live card
+      // is in the list** — the attached one marked 「已引用」 and disabled — while an
+      // archived card is not, and the count says how many the library holds.
+      'ChapterCards',
+      {
+        env,
+        groups: [
+          // 陈默（活）+ 老周（已存档）+ 方衡：老周必须在列表里消失，计数只数活卡。
+          { type: 'character', label: '角色', dir: 'characters', cards: [library.groups[0].cards[0], archivedCard, fangHeng] },
+          { type: 'lore', label: '设定', dir: 'lore', cards: [loreSetting] },
+        ],
+        attached: [{ id: 'fang-heng', field: 'characters', card: fangHeng }],
+        onAttach: () => {},
+        onDetach: () => {},
+        onRefresh: () => {},
+      },
+      ['＋ 加卡…', '方衡（已引用）', '陈默', '境界-凌空', '设定库 3 张', '刷新', '本章引用的卡', '· 1 张', '生成时会全部带上（1 张）', '!老周'],
+    ],
     ['OutlineView', { env, snapshot, cards: library.groups[0].cards, active: true, onOpenChapter: () => {}, onChanged: async () => {}, onOpenDocument: () => {} }, ['本卷卷纲', '续写卷纲', '按卷纲拆章', '楔子·雨夜', '要点 2']],
     [
       'SearchView',
@@ -603,6 +699,46 @@ function dimmedControlLines(source) {
   return violates(source.split(/\r?\n/))
 }
 
+/**
+ * A bundle with its comments removed.
+ *
+ * The artifact keeps doc comments, and this file's own guard is documented with
+ * the very string it looks for — so a scan that reads prose would fire on the
+ * explanation instead of the code. Only the code can contain a real call.
+ * @param source - the bundle text.
+ * @returns the same text without block or line comments.
+ */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+}
+
+/**
+ * Fail when the bundle requires a module the shell's frozen table cannot answer.
+ *
+ * The client artifact is a closure factory whose `require` is answered by DSH's
+ * module table (`PLATFORM_MODULES` in `tsdown.config.ts`) and nothing else: an
+ * unanswerable require in the bundle is not a slow path, it is a **throw at plugin
+ * load** — the panel simply never appears. That happened for real: a helper moved
+ * into a client file dragged the YAML parser in with it, and this check's Node-side
+ * `require` happily resolved the package from node_modules, so every other
+ * assertion stayed green while the browser half was broken.
+ *
+ * Reading the allowed list out of the build config is the point: the two cannot
+ * drift, and the failure names the specifier that is wrong.
+ */
+async function checkModuleTable() {
+  const allowed = PLATFORM_TABLE
+  const bundle = stripComments(await readFile(new URL('../lib/client.js', import.meta.url), 'utf8'))
+  const asked = new Set([...bundle.matchAll(/require\("([^"]+)"\)/g)].map(match => match[1]))
+  const unknown = [...asked].filter(name => !allowed.has(name))
+  if (unknown.length > 0) {
+    throw new Error(`client bundle requires ${unknown.join(', ')}, which the shell's module table cannot answer — inline it (see novel/buffer.ts for why)`)
+  }
+  console.log(`  module-table rule: bundle asks only for ${String(asked.size)} shared modules (${[...asked].join(', ')})`)
+}
+
 /** Run the source rule over every client view. */
 async function checkDimmedControls() {
   const directory = new URL('../src/client/', import.meta.url)
@@ -617,4 +753,30 @@ async function checkDimmedControls() {
     checked += 1
   }
   console.log(`  dimmed-control rule: ${String(checked)} view files clean`)
+}
+
+/**
+ * Fail when an editor hand-rolls "has the document changed?".
+ *
+ * The chapter editor used to compare `body` / `title` / `status` / `targetWords`
+ * and nothing else, while the card picker and the beats editor also write
+ * `characters` / `locations` / `refs` / `beats` — so attaching a referenced card
+ * left the buffer reading as unchanged: 保存 stayed disabled, the unsaved-changes
+ * prompt never fired, and the reference was gone on the next chapter switch. A
+ * per-field list is a bug that grows with every new field; the three editors that
+ * own a document must ask `documentChanged()` (`novel/document.ts`) instead.
+ */
+async function checkDirtyFlags() {
+  const directory = new URL('../src/client/', import.meta.url)
+  const editors = ['Panel.tsx', 'SettingsView.tsx', 'OutlineView.tsx']
+  for (const name of editors) {
+    const source = await readFile(new URL(name, directory), 'utf8')
+    if (!source.includes('documentChanged(')) {
+      throw new Error(`${name} 没有用 documentChanged() 判断改动——不要自己列字段（refs/characters/locations/beats 也都是改动）`)
+    }
+    if (/JSON\.stringify\([A-Za-z]+\.data\)/.test(source)) {
+      throw new Error(`${name} 自己拼了 frontmatter 比较，改用 documentChanged()`)
+    }
+  }
+  console.log(`  dirty-flag rule: ${String(editors.length)} editors ask documentChanged()`)
 }

@@ -15,6 +15,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { BOOK_OUTLINE_FILE, volumeOutlinePath } from '../novel/paths.ts'
+import { documentChanged } from '../novel/buffer.ts'
 import type { CardSummary, ChapterSummary, ProjectSnapshot } from '../novel/project.ts'
 import type { PlanChapter } from './plan.ts'
 import * as api from './api.ts'
@@ -363,8 +364,7 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
   // any more, and listing them here would invite re-planning over a scene the
   // author took back out. They stay visible (and restorable) in the 正文 tree.
   const planned = (selected?.chapters ?? []).filter(item => !item.archived)
-  const outlineDirty = outline !== undefined
-    && (outline.body !== outline.original.body || JSON.stringify(outline.data) !== JSON.stringify(outline.original.data))
+  const outlineDirty = outline !== undefined && documentChanged(outline, outline.original)
   const beats = chapter === undefined ? [] : beatsOf(chapter.data)
 
   /**
@@ -579,7 +579,7 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
   )
 }
 
-/** Whether a chapter's beats differ from what was loaded. */
+/** Whether a chapter's outline (its frontmatter, which is where the beats live) differs from what was loaded. */
 function beatsDirty(doc: OpenDoc): boolean {
-  return JSON.stringify(doc.data) !== JSON.stringify(doc.original.data)
+  return documentChanged(doc, doc.original)
 }

@@ -29,6 +29,8 @@
 import { isDocumentPath, isSlug, cardPath, cardTypeOfPath, cardIdOfPath, volumeOutlinePath, BOOK_OUTLINE_FILE } from '../src/novel/paths.ts'
 import { summarizeChapter, summarizeCard, groupCards, referenceIndex, readThread, threadChaptersOf } from '../src/novel/project.ts'
 import { parseDocument, serializeDocument } from '../src/novel/document.ts'
+import { documentChanged } from '../src/novel/buffer.ts'
+import { writeDenialNote } from '../src/novel/sandbox.ts'
 import { countWords } from '../src/novel/words.ts'
 import { parsePlan } from '../src/client/plan.ts'
 import { findQuote, lineAt, pointedText } from '../src/client/locate.ts'
@@ -44,7 +46,7 @@ import { chineseNumber, exportFileName, renderExport, safeStem, stripChapterNumb
 import { findQuote as findQuoteHost, lineNumberOf } from '../src/novel/quote.ts'
 import { actionFor, shortcutHelp, shortcutLabel, KEY_BINDINGS } from '../src/client/shortcuts.ts'
 import { PANEL_SECTIONS, liveThreads } from '../src/client/ui.ts'
-import { CARD_FIELDS, CARD_SECTIONS, cardBodyHint, cardHasField, isRetiredCard, liveCards, roleLabels, roleValue, splitListText } from '../src/novel/cards.ts'
+import { CARD_FIELDS, CARD_SECTIONS, cardBodyHint, cardHasField, chapterRefFieldOf, isRetiredCard, liveCards, roleLabels, roleValue, splitListText } from '../src/novel/cards.ts'
 import {
   askText,
   askYesNo,
@@ -160,6 +162,73 @@ console.log('\n--- frontmatter 往返 ---')
 const round = parseDocument(serializeDocument({ id: 'c0001', beats: ['甲', '乙'] }, '正文\n'))
 check('序列化再解析不丢字段', round.data.id === 'c0001' && round.data.beats.join() === '甲,乙')
 check('正文原样保留', round.body.trim() === '正文')
+
+// 「有没有改动」是**整份 frontmatter** 的比较，不是一张记下来的字段清单。面板当年只比
+// body/title/status/targetWords，于是加一张引用卡（characters/locations/refs）后
+// 「没有改动」：保存按钮是灰的、切章不问、卡就这么丢了。
+console.log('\n--- 编辑器缓冲是不是「有改动」（documentChanged） ---')
+const baseChapter = {
+  data: { id: 'c0001', number: 1, title: '初临异界', characters: ['wu-ming'], locations: [], refs: ['jing-jie-ling-kong'] },
+  body: '正文。\n',
+}
+check('一字未动的缓冲不算改动', !documentChanged(baseChapter, { data: { ...baseChapter.data }, body: baseChapter.body }))
+check('正文改了算改动', documentChanged({ ...baseChapter, body: '正文。又一行。\n' }, baseChapter))
+check('往 refs / characters / locations 里加一个 id 都算改动（这正是丢卡的那三个字段）',
+  ['refs', 'characters', 'locations'].every(field =>
+    documentChanged({ ...baseChapter, data: { ...baseChapter.data, [field]: ['多出来的一张'] } }, baseChapter)))
+check('删掉一个引用也算改动',
+  documentChanged({ ...baseChapter, data: { ...baseChapter.data, refs: [] } }, baseChapter))
+check('章纲（beats）与存档标记同样算改动',
+  documentChanged({ ...baseChapter, data: { ...baseChapter.data, beats: ['要点'] } }, baseChapter)
+  && documentChanged({ ...baseChapter, data: { ...baseChapter.data, archived: true } }, baseChapter))
+check('值没变就不算（保存后 original 重新种下，不会一直显示「有未保存修改」）',
+  !documentChanged({ ...baseChapter, data: { ...baseChapter.data, refs: [...baseChapter.data.refs] } }, baseChapter))
+
+// 被 DSH 文件沙箱拒写时，面板以前只能显示一句「access denied」——而这一层是唯一同时
+// 知道「会话可写根」与「工程在哪」的地方。作者 9/14 撞的就是这个：会话的 cwd 不是工程
+// 目录时，整本书读得到、写全都拒（`sandboxPolicy.resolve` 拿 `session.header.cwd` 当根）。
+console.log('\n--- 写入被沙箱拒了怎么说（writeDenialNote） ---')
+const denialBase = {
+  code: 'FS_SANDBOX_DENIED',
+  mode: 'workspace-write',
+  workspaceRoot: 'C:\\Users\\me',
+  projectRoot: 'E:\\GameProject\\AI-Novel-Copilot\\novel',
+  session: { id: 'session-1', found: true, cwd: 'C:\\Users\\me' },
+}
+const outside = writeDenialNote(denialBase)
+check('说清「会话可写根」与「工程在哪」，并给出出路',
+  outside.includes('C:\\Users\\me') && outside.includes('E:\\GameProject\\AI-Novel-Copilot\\novel')
+  && outside.includes('workspace-write') && outside.includes('danger-full-access')
+  && outside.includes('工程不在可写根下面'))
+check('工程确实在可写根下面时不猜原因（只报两个事实）',
+  (() => {
+    const inside = writeDenialNote({
+      ...denialBase,
+      code: 'FS_PERMISSION_DENIED',
+      workspaceRoot: 'E:\\GameProject\\AI-Novel-Copilot',
+    })
+    return inside.includes('E:\\GameProject\\AI-Novel-Copilot') && !inside.includes('不在可写根下面')
+  })())
+check('大小写与分隔符不影响判断（Windows 上那是同一个目录）',
+  (() => {
+    const same = writeDenialNote({
+      ...denialBase,
+      workspaceRoot: 'e:/gameProject/ai-novel-copilot/',
+      projectRoot: 'E:\\GameProject\\AI-Novel-Copilot\\novel\\',
+    })
+    return same.includes('可写的根是') && !same.includes('不在可写根下面')
+  })())
+check('会话已经不存在时说出来（面板绑的会话被关掉/换掉了）',
+  writeDenialNote({ ...denialBase, session: { id: 'session-dead', found: false } })
+    .includes('session-dead') === true
+  && writeDenialNote({ ...denialBase, session: { id: 'session-dead', found: false } })
+    .includes('重开一下面板') === true)
+check('会话存在但没有 cwd 时说出来（用的是 DSH 启动时那个根）',
+  writeDenialNote({ ...denialBase, session: { id: 'session-2', found: true } })
+    .includes('这个会话没有 cwd') === true)
+check('不是沙箱/权限类的失败不加这段（别把别的错误说成沙箱）',
+  writeDenialNote({ ...denialBase, code: 'FS_STALE_VERSION' }) === undefined
+  && writeDenialNote({ ...denialBase, code: 'novel/bad-request' }) === undefined)
 
 console.log('\n--- 拆章 JSON 解析 ---')
 const fenced = parsePlan('好的，这是计划：\n```json\n[{"title":"第 2 章 巡夜人","beats":"撞见巡夜人","characters":["chen-mo"],"targetWords":3000}]\n```')
@@ -796,6 +865,16 @@ const FILES = {
   // The generic setting card a chapter references through `refs` — a cultivation
   // ladder is exactly what used to have nowhere to live but the world overview.
   'settings/lore/jian-xiu-jingjie.md': '---\nid: jian-xiu-jingjie\nname: 剑修境界\n---\n\n## 分级\n练气 → 筑基 → 剑心 → 无我。\n',
+  // A location the fixture chapter names: `locations` used to be read only by the
+  // model check, never by the writing tasks.
+  'settings/locations/old-town.md': '---\nid: old-town\nname: 老镇\n---\n\n## 地理\n一条土路。\n',
+  // Seven more referenced cards, so the fixture chapter carries ten: more than the
+  // six-card cap that used to trim the list. **每章由作者主动引用的卡必须全部进
+  // prompt**（作者 9/15 的要求），所以这里要能被数出来。
+  ...Object.fromEntries(['a', 'b', 'c', 'd', 'e', 'f', 'g'].map(letter => [
+    `settings/lore/probe-${letter}.md`,
+    `---\nid: probe-${letter}\nname: 探针${letter}\n---\n\n## 定义\n第 ${letter} 张。\n`,
+  ])),
   'chapters/v01/c0001.md': chapterText,
 }
 const requested = []
@@ -836,7 +915,7 @@ const ctx = {
   volumes: [{ dir: 'v01', volume: 1, chapters: [c1, c2] }],
   chapter: {
     path: 'chapters/v01/c0002.md',
-    data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'], characters: ['chen-mo'], pov: 'chen-mo', refs: ['jian-xiu-jingjie'] },
+    data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'], characters: ['chen-mo'], locations: ['old-town'], pov: 'chen-mo', refs: ['jian-xiu-jingjie', 'probe-a', 'probe-b', 'probe-c', 'probe-d', 'probe-e', 'probe-f', 'probe-g'] },
     body: '他握紧青铜镜。',
     wordCount: 8,
     version: '',
@@ -863,6 +942,38 @@ check('整章任务的输入清单列出每个文件',
   && whole.inputs.some(item => item.path === 'style/style-guide.md')
   && whole.inputs.some(item => item.path === 'settings/characters/chen-mo.md'))
 check('整章任务替换正文并声明目标字数', whole.apply === 'replace-body' && whole.prompt.includes('3000 字'))
+
+// 作者要的「给某一章设定引用的卡」：正文页点选的那张卡，写作任务都要带上——
+// 续写 / 改写 / 扩写 / 润色 / 整章 读的是同一份材料（`assembleCommon`）。
+console.log('\n--- 本章引用的卡随写作任务一起进 prompt ---')
+const continuation = await assemble(CHAPTER_TASKS[1], ctx)
+const rewrite = await assemble(CHAPTER_TASKS[2], ctx)
+const expansion = await assemble(CHAPTER_TASKS[3], ctx)
+const writing = [continuation, rewrite, expansion]
+check('续写 / 改写 / 扩写 都带上本章引用的卡（角色、地点、设定各一张）',
+  writing.every(task => task.prompt.includes('【本章相关设定】')
+    && task.prompt.includes('## chen-mo') && task.prompt.includes('## old-town')
+    && task.prompt.includes('## jian-xiu-jingjie')))
+check('这些卡也在各自的输入清单里（作者看得见模型读了什么）',
+  writing.every(task => ['settings/characters/chen-mo.md', 'settings/locations/old-town.md', 'settings/lore/jian-xiu-jingjie.md']
+    .every(path => task.inputs.some(item => item.path === path))))
+check('地点也进来了：`locations` 不再是「写了但不读」的字段',
+  continuation.prompt.includes('一条土路。'))
+// 作者 9/15 的要求：**每章由我主动引用的卡必须全部进入 prompt**。这一章有 10 张（1 角色 +
+// 1 地点 + 8 设定），比当年那个 6 张上限多——曾经的 `.slice(0, 6)` 会静默砍掉后面四张。
+const referencedIds = ['chen-mo', 'old-town', 'jian-xiu-jingjie', ...['a', 'b', 'c', 'd', 'e', 'f', 'g'].map(letter => `probe-${letter}`)]
+check('本章引用的卡**全部**进 prompt，没有上限（过去 6 张之外的会被静默丢掉）',
+  writing.every(task => referencedIds.every(id => task.prompt.includes(`## ${id}`)))
+  && whole.prompt.includes('## probe-g'),
+  referencedIds.length > 6 ? `共 ${String(referencedIds.length)} 张` : '')
+check('这十张也全部出现在输入清单里（作者数得出来）',
+  writing.every(task => referencedIds.every(id =>
+    task.inputs.some(item => item.path.endsWith(`/${id}.md`)))))
+check('没有引用卡的章不会被塞进一个空小节',
+  !(await assemble(CHAPTER_TASKS[1], {
+    ...ctx,
+    chapter: { ...ctx.chapter, data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'] } },
+  })).prompt.includes('【本章相关设定】'))
 
 const volumeTask = await assemble(OUTLINE_TASKS[0], ctx)
 check('卷纲任务写明落盘目标', volumeTask.target === 'outline/volumes/v01.md' && volumeTask.apply === 'write-document')
@@ -992,6 +1103,11 @@ check('去 AI 味检查：issues 报告，且点名的毛病就是需求里那�
   styleCheck.kind === 'issues' && styleCheck.apply === 'report'
   && CHAPTER_TASKS[5].place === 'chapter'
   && ['口头禅', '排比', '总结句', '形容词', '对话腔调'].every(habit => styleCheck.prompt.includes(habit)))
+check('去 AI 味检查不带卡：既不在 prompt 里，也不能出现在输入清单里',
+  !styleCheck.prompt.includes('## chen-mo') && !styleCheck.prompt.includes('## jian-xiu-jingjie')
+  && styleCheck.inputs.every(item => !item.path.startsWith('settings/')))
+check('润色本章也带上本章引用的卡', polish.prompt.includes('【本章相关设定】')
+  && polish.prompt.includes('## jian-xiu-jingjie') && polish.prompt.includes('## old-town'))
 check('去 AI 味检查要求逐字引用、给可直接替换的写法、并限制条数',
   styleCheck.prompt.includes('逐字复制') && styleCheck.prompt.includes('可以直接替换或删除')
   && styleCheck.prompt.includes('最多 12 条'))
@@ -1991,6 +2107,11 @@ check('每种卡有自己的字段表：年龄与性别只属于角色，身份�
   && !cardHasField('location', 'role') && !cardHasField('location', 'age')
   && !cardHasField('item', 'gender') && !cardHasField('thread', 'gender'),
   Object.keys(CARD_FIELDS).map(type => `${type}=[${cardFieldsOf(type)}]`).join(' '))
+// 作者在正文页点选一张卡时，它落到哪个 frontmatter 字段由**类型**决定：
+// 角色 → characters（出场是它字面的意思）、地点 → locations、其余 → refs。
+check('点选一张卡按类型落到对应字段（角色→characters、地点→locations、其余→refs）',
+  chapterRefFieldOf('character') === 'characters' && chapterRefFieldOf('location') === 'locations'
+  && ['item', 'faction', 'lore', 'thread'].every(type => chapterRefFieldOf(type) === 'refs'))
 check('每种卡都有属于自己的正文分节（不是一律角色的那五行）',
   Object.keys(CARD_FIELDS).every(type => CARD_SECTIONS[type].length > 0)
   && CARD_SECTIONS.character.includes('外貌') && CARD_SECTIONS.location.includes('地理')

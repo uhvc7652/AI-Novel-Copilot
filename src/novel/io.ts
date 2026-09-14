@@ -48,6 +48,7 @@ import {
   WORLD_FILE,
 } from './paths.ts'
 import { CARD_SECTIONS } from './cards.ts'
+import { writeDenialNote } from './sandbox.ts'
 import { countWords } from './words.ts'
 import { checkProject, type CheckCard, type CheckChapter, type CheckCorpus, type CheckPage, type CheckRelation, type CheckReport } from './checks.ts'
 import {
@@ -468,10 +469,38 @@ export class NovelIo {
    */
   private async writeRaw(scope: NovelScope, relative: string, content: string): Promise<FsWriteOutcome> {
     const target = await this.target(scope, relative)
-    const outcome = await this.ctx.fs.writeText(target, content, undefined, undefined, this.policy(scope.sessionId))
-    // Our own write is the one change we never have to re-derive from a token.
-    this.cache.invalidate(scope.root, normalizeRelative(relative))
-    return outcome
+    const policy = this.policy(scope.sessionId)
+    try {
+      const outcome = await this.ctx.fs.writeText(target, content, undefined, undefined, policy)
+      // Our own write is the one change we never have to re-derive from a token.
+      this.cache.invalidate(scope.root, normalizeRelative(relative))
+      return outcome
+    } catch (error) {
+      // A sandbox denial is the author's environment talking, not a plugin bug:
+      // name the root this session may write under and where the book actually is,
+      // or the only thing the panel can say is "access denied". The message is
+      // appended to rather than wrapped — the code is what the HTTP layer maps to a
+      // status and what the panel prints, and a new error would drop it.
+      if (error instanceof Error) {
+        const raw = error as unknown as { code?: unknown }
+        const code = typeof raw.code === 'string' ? raw.code : error.name
+        const session = this.ctx.sessions.get(scope.sessionId)
+        const sessionCwd = session?.header?.cwd
+        const note = writeDenialNote({
+          code,
+          mode: policy.mode,
+          workspaceRoot: policy.workspaceRoot,
+          projectRoot: scope.root,
+          session: {
+            id: scope.sessionId,
+            found: session !== undefined,
+            ...(typeof sessionCwd === 'string' && sessionCwd !== '' ? { cwd: sessionCwd } : {}),
+          },
+        })
+        if (note !== undefined) error.message += ` ${note}`
+      }
+      throw error
+    }
   }
 
   /**

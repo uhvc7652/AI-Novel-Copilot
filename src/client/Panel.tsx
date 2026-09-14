@@ -17,9 +17,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { countWords } from '../novel/words.ts'
+import { documentChanged } from '../novel/buffer.ts'
+import { chapterRefFieldOf, type ChapterRefField } from '../novel/cards.ts'
 import { chapterIdOfPath, nextThreadId } from '../novel/paths.ts'
 import type { LoadedDocument, SettingsLibrary } from '../novel/io.ts'
-import type { ChapterStatus, ChapterSummary, ProjectSnapshot } from '../novel/project.ts'
+import type { CardSummary, ChapterStatus, ChapterSummary, ProjectSnapshot } from '../novel/project.ts'
 import type { CheckIssue, CheckReport } from '../novel/checks.ts'
 import * as api from './api.ts'
 import { pointedText, useQuoteLocate } from './locate.ts'
@@ -39,6 +41,7 @@ import { SearchView } from './SearchView.tsx'
 import { ChecksView } from './ChecksView.tsx'
 import { HistoryView } from './HistoryView.tsx'
 import { TaskBar } from './TaskBar.tsx'
+import { ChapterCards } from './ChapterCards.tsx'
 import { CHAPTER_TASKS, CHECK_TASKS, type TaskContext } from './tasks.ts'
 import {
   box,
@@ -108,6 +111,22 @@ function field(data: Record<string, unknown>, key: string): string {
   return ''
 }
 
+/**
+ * Read a chapter's card references out of frontmatter, tolerating a bare scalar.
+ *
+ * `characters` / `locations` / `refs` are hand-editable (format §3.2), and a
+ * single id written without brackets is legal — the panel must not show "no
+ * cards" for a chapter whose file says `refs: jian-xiu-jingjie`.
+ * @param data - the chapter's frontmatter.
+ * @param key - which reference field.
+ * @returns the ids, in the order written.
+ */
+function refsOf(data: Record<string, unknown>, key: ChapterRefField): string[] {
+  const value = data[key]
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+  return typeof value === 'string' && value.trim() !== '' ? [value.trim()] : []
+}
+
 /** A hidden section keeps its buffer but takes no space. */
 function sectionStyle(active: boolean): CSSProperties {
   return {
@@ -146,6 +165,8 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const [root, setRoot] = useState('')
   const [snapshot, setSnapshot] = useState<ProjectSnapshot>()
   const [library, setLibrary] = useState<SettingsLibrary>()
+  /** Why the library is not readable, when a read failed — shown beside the picker. */
+  const [libraryNote, setLibraryNote] = useState<string>()
   const [section, setSection] = useState<Section>('prose')
   const [open, setOpen] = useState<OpenChapter>()
   const [original, setOriginal] = useState<OpenChapter>()
@@ -287,10 +308,16 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     }
   }, [])
 
-  const dirty = open !== undefined && original !== undefined
-    && (open.body !== original.body || field(open.data, 'title') !== field(original.data, 'title')
-      || field(open.data, 'status') !== field(original.data, 'status')
-      || field(open.data, 'targetWords') !== field(original.data, 'targetWords'))
+  /**
+   * Whether the chapter buffer differs from the file.
+   *
+   * The **whole frontmatter** (`documentChanged`), not a list of remembered
+   * fields. This used to compare body/title/status/targetWords only, so adding a
+   * referenced card from the picker below left the buffer "unchanged": 保存 stayed
+   * disabled, no unsaved-changes prompt fired, and the reference was gone on the
+   * next chapter switch. Every editable field has to count.
+   */
+  const dirty = open !== undefined && original !== undefined && documentChanged(open, original)
 
   /**
    * Whether the document on screen differs from the file.
@@ -377,11 +404,37 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     return next
   }, [sessionId])
 
+  /**
+   * Re-read the settings library.
+   *
+   * A failure here is **not** swallowed: the picker's list is what the author
+   * checks a new card against, and a list that silently stayed stale is
+   * indistinguishable from a card that was never created (that is exactly how
+   * 「我新建了方衡，加卡里没有」 was reported). The reason travels to the row as a
+   * note, and 刷新 beside it retries.
+   */
   const reloadLibrary = useCallback(async (): Promise<void> => {
     const target = root.trim()
     if (target === '') return
-    setLibrary(await api.readCards(sessionId ?? '', target))
+    try {
+      setLibrary(await api.readCards(sessionId ?? '', target))
+      setLibraryNote(undefined)
+    } catch (error) {
+      setLibraryNote(`设定库没读出来：${error instanceof Error ? error.message : String(error)}（点「刷新」再试）`)
+    }
   }, [root, sessionId])
+
+  /**
+   * Keep the library current while the prose surface is on screen.
+   *
+   * One small read per chapter switch (the host is local) buys a list that is
+   * current whenever the author looks at it — the alternative is a picker that
+   * quietly shows yesterday's cards.
+   */
+  useEffect(() => {
+    if (section !== 'prose' || open === undefined) return
+    void reloadLibrary()
+  }, [open?.path, reloadLibrary, section])
 
   /**
    * Read one project into the panel and remember it.
@@ -401,8 +454,14 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     setCheckReport(undefined)
     checkedRef.current = false
     storeRecents(rememberProject(recentsRef.current, { root: target, title: next.title, at: Date.now() }))
-    // The card library is a second read; failing it must not fail the open.
-    void api.readCards(sessionId ?? '', target).then(setLibrary, () => {})
+    // The card library is a second read; failing it must not fail the open — but
+    // it must not vanish either, so the reason goes to the picker's note.
+    void api.readCards(sessionId ?? '', target).then(
+      next => { setLibrary(next); setLibraryNote(undefined) },
+      error => {
+        setLibraryNote(`设定库没读出来：${error instanceof Error ? error.message : String(error)}（点「刷新」再试）`)
+      },
+    )
     return `已打开《${next.title}》：${String(next.chapterCount)} 章，${String(next.wordCount)} 字`
   }, [refresh, rememberRoot, sessionId, storeRecents])
 
@@ -977,6 +1036,62 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     })
   }, [])
 
+  /** Every setting card in the library, by id — what a reference chip resolves against. */
+  const cardsById = useMemo(
+    () => new Map((library?.groups ?? []).flatMap(group => group.cards).map(card => [card.id, card])),
+    [library],
+  )
+
+  /**
+   * The cards this chapter is written against, as chips.
+   *
+   * All three reference fields, in format order, so a card attached from the
+   * outline page (by id) shows up here exactly like one attached from this row. A
+   * card the library does not know is still listed: the file says it is
+   * referenced, and hiding it would hide a `missing-ref` the author has to fix.
+   */
+  const chapterCards = useMemo(() => {
+    const fields: ChapterRefField[] = ['characters', 'locations', 'refs']
+    return fields.flatMap(field => refsOf(open?.data ?? {}, field)
+      .map(id => ({ id, field, card: cardsById.get(id) })))
+  }, [cardsById, open])
+
+  /**
+   * Attach one card to the open chapter, in the field its type belongs to.
+   *
+   * Routed by type (`chapterRefFieldOf`) rather than by "what the author meant":
+   * a character card in `characters` is what 出场 means to `pov-unlisted` and to
+   * retrieval's "who appears in which chapter". Every writing task reads all
+   * three fields, so wherever the id lands, the next 续写 / 改写 / 扩写 sees it.
+   */
+  const attachCard = useCallback((id: string) => {
+    const card = cardsById.get(id)
+    if (card === undefined) return
+    const field = chapterRefFieldOf(card.type)
+    setOpen(previous => {
+      if (previous === undefined) return previous
+      const ids = refsOf(previous.data, field)
+      if (ids.includes(id)) return previous
+      return { ...previous, data: { ...previous.data, [field]: [...ids, id] } }
+    })
+    say(`已把「${card.name}」记为本章引用——生成任务会带上它，保存后落盘`)
+  }, [cardsById, say])
+
+  /**
+   * Detach one card from the open chapter.
+   *
+   * An emptied field is written as `[]`, which is what the scaffold and the
+   * outline editor write — an absent key would be a third shape for the same
+   * fact.
+   */
+  const detachCard = useCallback((id: string, field: ChapterRefField) => {
+    setOpen(previous => {
+      if (previous === undefined) return previous
+      const ids = refsOf(previous.data, field).filter(entry => entry !== id)
+      return { ...previous, data: { ...previous.data, [field]: ids } }
+    })
+  }, [])
+
   /** Take a generated chapter body into the editor buffer, still unsaved. */
   const onProse = useCallback((text: string, apply: 'append' | 'replace', label: string) => {
     setOpen(previous => {
@@ -1290,6 +1405,19 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
                 </button>
               </div>
             )}
+            {/* The cards this chapter is written against — attached here, where the
+                tasks that use them are. Routed by card type into frontmatter
+                (`chapterRefFieldOf`), so this row and the outline page's id fields
+                are two views of one thing. */}
+            <ChapterCards
+              env={env}
+              {...(library === undefined ? {} : { groups: library.groups })}
+              attached={chapterCards}
+              onAttach={attachCard}
+              onDetach={detachCard}
+              onRefresh={() => { void reloadLibrary() }}
+              {...(libraryNote === undefined ? {} : { note: libraryNote })}
+            />
             <TaskBar
               env={env}
               tasks={CHAPTER_TASKS}
