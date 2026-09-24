@@ -173,7 +173,9 @@ export function ExportView({ env, snapshot, openChapter }: ExportViewProps) {
           <select style={input} value={String(volume)} onChange={event => { setVolume(Number(event.target.value)) }}>
             {snapshot.volumes.map(item => (
               <option key={item.dir} value={String(item.volume)}>
-                第 {String(item.volume)} 卷（{String(item.chapters.filter(chapter => !chapter.archived).length)} 章）
+                第 {String(item.volume)} 卷
+                {item.title === undefined || item.title.trim() === '' ? '' : ` · ${item.title}`}
+                （{String(item.chapters.filter(chapter => !chapter.archived).length)} 章）
               </option>
             ))}
           </select>

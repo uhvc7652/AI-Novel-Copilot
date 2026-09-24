@@ -232,7 +232,9 @@ function checkSurfaces(face, react, render) {
     title: '测试之书',
     genre: '中文长篇网文',
     targetWords: 1000000,
-    volumes: [{ dir: 'v01', volume: 1, chapters: [chapter] }],
+    // 第一卷带了卷名（卷纲 frontmatter 的 `title`，格式 §4.11）：下拉与章节树都用它，
+    // 而没起名的卷只有卷号。
+    volumes: [{ dir: 'v01', volume: 1, title: '青石镇', chapters: [chapter] }],
     chapterCount: 1,
     wordCount: 1200,
   }
@@ -423,23 +425,31 @@ function checkSurfaces(face, react, render) {
       'ChapterContext',
       {
         env,
-        volumes: [{
-          dir: 'v01',
-          volume: 1,
-          chapters: [
-            chapter,
-            { ...chapter, path: 'chapters/v01/c0002.md', id: 'c0002', number: 2, title: '第二章 巡夜人' },
-            { ...chapter, path: 'chapters/v01/c0003.md', id: 'c0003', number: 3, title: '第三章 撤掉的', archived: true },
-          ],
-        }],
+        volumes: [
+          {
+            dir: 'v01',
+            volume: 1,
+            chapters: [
+              chapter,
+              { ...chapter, path: 'chapters/v01/c0002.md', id: 'c0002', number: 2, title: '第二章 巡夜人' },
+              { ...chapter, path: 'chapters/v01/c0003.md', id: 'c0003', number: 3, title: '第三章 撤掉的', archived: true },
+            ],
+          },
+          // 第二卷：有卷名，且**还没有章节**——它不该出现在可选列表里（没有章可选），
+          // 但卷名本身是「这一卷已经计划好了」的证据。
+          { dir: 'v02', volume: 2, title: '北境篇', chapters: [] },
+        ],
         openPath: chapter.path,
         attached: ['c0002'],
         onAttach: () => {},
         onDetach: () => {},
       },
-      ['参考章节', '＋ 加章节…', '第 1 卷', '第二章 巡夜人（已引用）', '可选的章 1 章', '生成时会带上它们的全文（1 章）', '!楔子·雨夜', '!第三章 撤掉的'],
+      ['参考章节', '＋ 加章节…', '第 1 卷', '第二章 巡夜人（已引用）', '可选的章 1 章', '生成时会带上它们的全文（1 章）', '!楔子·雨夜', '!第三章 撤掉的', '!北境篇'],
     ],
-    ['OutlineView', { env, snapshot, cards: library.groups[0].cards, active: true, onOpenChapter: () => {}, onChanged: async () => {}, onOpenDocument: () => {} }, ['本卷卷纲', '续写卷纲', '按卷纲拆章', '楔子·雨夜', '要点 2']],
+    ['OutlineView', { env, snapshot, cards: library.groups[0].cards, active: true, onOpenChapter: () => {}, onChanged: async () => {}, onOpenDocument: () => {} }, ['本卷卷纲', '续写卷纲', '按卷纲拆章', '楔子·雨夜', '要点 2',
+      // 卷的管理：卷名进下拉，新建卷就在同一行，卷名输入框带占位提示。
+      // （服务端渲染不跑 effect，所以卷纲正文还没读出来——这里查的是这一行的控件。）
+      '第 1 卷 · 青石镇', '＋ 新建卷', '卷的名字']],
     [
       'SearchView',
       { env, chapters: [chapter], onOpenChapter: () => {}, onOpenCard: () => {} },

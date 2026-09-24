@@ -26,8 +26,8 @@
  *
  * Usage: node --experimental-transform-types spike/format-check.mjs
  */
-import { isDocumentPath, isSlug, cardPath, cardTypeOfPath, cardIdOfPath, volumeOutlinePath, BOOK_OUTLINE_FILE } from '../src/novel/paths.ts'
-import { summarizeChapter, summarizeCard, groupCards, referenceIndex, readThread, threadChaptersOf } from '../src/novel/project.ts'
+import { isDocumentPath, isSlug, cardPath, cardTypeOfPath, cardIdOfPath, volumeOutlinePath, volumeOutlineSkeleton, BOOK_OUTLINE_FILE } from '../src/novel/paths.ts'
+import { summarizeChapter, summarizeCard, groupCards, referenceIndex, readThread, threadChaptersOf, mergeVolumes, nextChapterNumber, scaffoldFiles } from '../src/novel/project.ts'
 import { parseDocument, serializeDocument } from '../src/novel/document.ts'
 import { documentChanged } from '../src/novel/buffer.ts'
 import { writeDenialNote } from '../src/novel/sandbox.ts'
@@ -155,6 +155,38 @@ const retired = summarizeChapter('chapters/v01/c0002.md', '---\nid: c0002\nnumbe
 check('已存档的章被标记出来', retired.archived === true && c1.archived === false)
 check('手写 archived: false 不算存档',
   summarizeChapter('chapters/v01/c0004.md', '---\narchived: false\n---\n\n').archived === false)
+
+console.log('\n--- 卷：卷纲存在即成立，章号全书连续 ---')
+// 卷有**两个**来源：`chapters/vNN/` 里的章节，和 `outline/volumes/vNN.md` 卷纲。
+// 后者是「先计划、后写」的前提——第二卷的卷纲写下来，它就出现在每一个卷下拉里，
+// 哪怕一个字都还没写；只有章节能造出卷的话，那一卷在写第一章之前根本不存在。
+const merged = mergeVolumes([c1], [{ volume: 2, title: '北境篇' }])
+check('只写了卷纲的卷也算存在，且带着作者起的卷名',
+  merged.map(volume => volume.volume).join() === '1,2'
+  && merged[1]?.chapters.length === 0
+  && merged[1]?.title === '北境篇'
+  && merged[0]?.title === undefined)
+check('两种来源合并且按卷号排序',
+  mergeVolumes([{ ...c1, volume: 3 }], [{ volume: 1 }, { volume: 2, title: '北境篇' }])
+    .map(volume => `${String(volume.volume)}:${String(volume.chapters.length)}`).join() === '1:0,2:0,3:1')
+check('两种来源都认得同一卷时，章节与卷名都在',
+  mergeVolumes([c1], [{ volume: 1, title: '青石镇' }])[0]?.title === '青石镇'
+  && mergeVolumes([c1], [{ volume: 1, title: '青石镇' }])[0]?.chapters.length === 1)
+// 章号**全书连续**（第二卷第一章就是第 3 章）：这是「id 由章号推出」唯一的前提，
+// 而 id 是伏笔、时间线、参考章节唯一的指法。
+const twoVolumes = mergeVolumes([
+  summarizeChapter('chapters/v01/c0001.md', '---\nnumber: 1\n---\n\n'),
+  summarizeChapter('chapters/v02/c0002.md', '---\nnumber: 2\nvolume: 2\n---\n\n'),
+], [])
+check('下一个章号是全书最大号 + 1（不按卷重数）', nextChapterNumber(twoVolumes) === 3)
+check('存档章占着的号不释放',
+  nextChapterNumber(mergeVolumes([summarizeChapter('chapters/v01/c0001.md', '---\nnumber: 1\narchived: true\n---\n\n')], [])) === 2)
+check('没有章节时从第 1 章开始', nextChapterNumber([]) === 1)
+// 卷纲骨架只有一份：新工程的脚手架与面板的「新建卷」写出来的是同一个文件。
+check('卷纲骨架两边同源（脚手架与面板的「新建卷」）',
+  scaffoldFiles('测试之书').find(file => file.path === volumeOutlinePath(1))?.content === volumeOutlineSkeleton(1)
+  && volumeOutlineSkeleton(2).startsWith('# 第 2 卷\n')
+  && volumeOutlineSkeleton(2).includes('## 卷末状态'))
 
 console.log('\n--- 设定卡 ---')
 const card = summarizeCard('settings/characters/chen-mo.md', [
@@ -729,6 +761,43 @@ check('参考章节写成本章自己：提示，不是错误', (() => {
 })())
 check('参考章节指到活章：不报（规则没有被写成「凡引用皆可疑」）',
   !findRule('context-ref').some(issue => issue.key.endsWith(':c0005')))
+
+// ── 章号是**全书**连续的（第二卷第一章 = 第 3 章），所以这两条也按全书判 ────────
+// 旧规则逐卷从 1 数起：第二卷的每一章都会被报成缺号，而两卷各有一个第 3 章反而不报。
+const crossNumbered = runChecks({
+  chapters: [
+    checkChapter('c0001', 1),
+    checkChapter('c0002', 2),
+    checkChapter('c0003', 3, { path: 'chapters/v02/c0003.md', volume: 2 }),
+    checkChapter('c0004', 3),
+  ],
+  cards: [],
+  pages: [],
+})
+check('跨卷的重号算重号（章号全书唯一）',
+  crossNumbered.some(issue => issue.rule === 'chapter-number'
+    && issue.key.endsWith(':3')
+    && issue.title.includes('全书有两个第 3 章')
+    && issue.evidence.length === 2
+    && issue.evidence.some(line => line.includes('chapters/v01/c0004.md'))
+    && issue.evidence.some(line => line.includes('chapters/v02/c0003.md'))),
+  crossNumbered.map(issue => issue.key).join(' '))
+check('第二卷从第 3 章开始不算缺号（旧规则会把 1、2 报成洞）',
+  !crossNumbered.some(issue => issue.rule === 'chapter-gap'),
+  crossNumbered.map(issue => issue.key).join(' '))
+const crossGap = runChecks({
+  chapters: [
+    checkChapter('c0001', 1),
+    checkChapter('c0004', 4, { path: 'chapters/v02/c0004.md', volume: 2 }),
+  ],
+  cards: [],
+  pages: [],
+})
+check('卷与卷之间缺号也报（第 3 章既不在第一卷也不在第二卷）',
+  crossGap.some(issue => issue.rule === 'chapter-gap'
+    && issue.key === 'chapter-gap:chapters/v02/c0004.md:3'
+    && issue.title.includes('全书缺第 3 章')),
+  crossGap.map(issue => issue.key).join(' '))
 check('伏笔指向不存在的章节', has('thread-ref', 'settings/threads/fs-005.md', 'c9999'))
 check('时间线指向不存在的章节', has('timeline-ref', 'settings/timeline.md', 'c9999'))
 check('名字/别名撞车：共用别名「默哥」的两张卡各报一条', (() => {
@@ -738,11 +807,14 @@ check('名字/别名撞车：共用别名「默哥」的两张卡各报一条', 
 })())
 check('别名与另一张卡的 id 撞车另算一条', findRule('alias-clash').some(issue =>
   issue.severity === 'warn' && issue.path === 'settings/characters/ghost-2.md'))
-check('章号重复（两个第 3 章）', has('chapter-number', 'chapters/v01/c0003.md', '两个第 3 章'))
+check('章号重复（两个第 3 章）', has('chapter-number', 'chapters/v01/c0003.md', '全书有两个第 3 章'))
+// 章号是**全书**连续的（第二卷第一章就是第 3 章），所以缺号也按全书判：这一堆章的号
+// 是 1,2,3,5,6，只有第 4 章没人占。存档章占着的 2 与 6 不算洞。
 check('章号缺号只报真正没人占的号：第 2 章归存档章，第 4 章才是洞', (() => {
   const gaps = findRule('chapter-gap')
-  return gaps.length === 1 && gaps[0].key === 'chapter-gap:chapters/v01/c0004.md:v1:4'
+  return gaps.length === 1 && gaps[0].key === 'chapter-gap:chapters/v01/c0004.md:4'
     && gaps[0].path === 'chapters/v01/c0004.md'
+    && gaps[0].title.includes('全书缺第 4 章')
 })())
 check('id 与文件名不一致', has('id-mismatch', 'chapters/v01/c0004.md', 'c0009'))
 check('时间线倒序', has('timeline-order', 'settings/timeline.md', '倒序'))
@@ -824,7 +896,7 @@ check('存档章不再被 word-drift 念叨（它已经不在字数里了）',
 check('但存档章的 id 声明错误照旧报（它仍是有效的引用目标）',
   findRule('id-mismatch').some(issue => issue.path.endsWith('c0006.md') && issue.key.endsWith(':c0099')))
 check('存档章的章号仍然占位（缺号只报真正没人占的号）',
-  findRule('chapter-gap').length === 1 && findRule('chapter-gap')[0].key.endsWith(':v1:4'))
+  findRule('chapter-gap').length === 1 && findRule('chapter-gap')[0].key.endsWith(':4'))
 check('firstAppear 只对活章比较：更早的登记发生在一张存档章上时不算不一致',
   !findRule('firstappear-mismatch').some(issue => issue.path.endsWith('old-towner.md')))
 
@@ -935,6 +1007,7 @@ const FILES = {
     `---\nid: probe-${letter}\nname: 探针${letter}\n---\n\n## 定义\n第 ${letter} 张。\n`,
   ])),
   'chapters/v01/c0001.md': chapterText,
+  'chapters/v01/c0002.md': '---\nid: c0002\nnumber: 2\ntitle: 第二章 巡夜人\nsummary: 巡夜人敲了门。\n---\n\n巡夜人敲了下一家的门。\n',
   'chapters/v01/c0007.md': contextChapterText,
 }
 const requested = []
@@ -1079,6 +1152,22 @@ check('去 AI 味检查不带章节正文（输入清单说的是模型读了什
   && !styleOnly.prompt.includes('【上一章】')
   && !styleOnly.inputs.some(item =>
     item.path === 'chapters/v01/c0001.md' || item.path === 'chapters/v01/c0007.md'))
+
+// 卷边界：章号全书连续，所以第二卷的第一章的「上一章」是**第一卷的最后一章**——
+// 而它在自己那一卷里没有上一个号。旧实现只在本卷里找，跨卷的第一章会拿到空的上一章。
+const c3v2 = summarizeChapter('chapters/v02/c0003.md', '---\nid: c0003\nvolume: 2\nnumber: 3\ntitle: 第三章 出镇\n---\n\n')
+const crossingCtx = {
+  ...ctx,
+  volume: 2,
+  chapter: { path: 'chapters/v02/c0003.md', data: { number: 3, title: '第三章 出镇', beats: [] }, body: '', wordCount: 0, version: '' },
+  volumes: [{ dir: 'v01', volume: 1, chapters: [c1, c2] }, { dir: 'v02', volume: 2, chapters: [c3v2] }],
+}
+const crossing = await assemble(CHAPTER_TASKS[1], crossingCtx)
+check('跨卷的「上一章」是第一卷的最后一章（本卷里没有上一个号也要接上）',
+  crossing.prompt.includes('【上一章】第 2 章')
+  && crossing.prompt.includes('巡夜人敲了下一家的门。')
+  && crossing.inputs.some(item => item.path === 'chapters/v01/c0002.md' && item.reason.includes('上一章全文')),
+  crossing.prompt.slice(0, 200))
 
 const volumeTask = await assemble(OUTLINE_TASKS[0], ctx)
 check('卷纲任务写明落盘目标', volumeTask.target === 'outline/volumes/v01.md' && volumeTask.apply === 'write-document')
@@ -1426,6 +1515,44 @@ check('已存档的章退出计数、但仍留在树里',
   JSON.stringify({ live: archivedSnapshot.chapterCount, archived: archivedSnapshot.archivedCount }))
 check('存档不释放章号：下一章仍然是第 4 章',
   (await io.createChapter(scope, { volume: 1, title: '第四章' })).number === 4)
+
+console.log('\n--- 卷：只写卷纲的卷也成立，章号跨卷连续（host 侧） ---')
+// 自己的替身与工程，避免改动上面那本已经排好号的测试书（那一段在数字号上做了断言）。
+const volumeFs = memoryFs()
+const volumeScope = { root: '', sessionId: 'spike-session' }
+const volumeIo = new NovelIo({
+  fs: volumeFs,
+  sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: '' }) },
+  sessions: { get: () => undefined },
+})
+await volumeIo.scaffold(volumeScope, '卷测试之书')
+// 面板的「新建卷」走的就是这条文档通道：写一份卷纲（可以带作者起的卷名）。
+await volumeIo.writeDocument(volumeScope, volumeOutlinePath(2), { title: '北境篇' }, volumeOutlineSkeleton(2))
+const planned = await volumeIo.snapshot(volumeScope)
+check('只写了卷纲的第二卷出现在工程树里（还没有任何章节）',
+  planned.volumes.map(volume => volume.volume).join() === '1,2'
+  && planned.volumes[1]?.chapters.length === 0
+  && planned.volumes[1]?.dir === 'v02',
+  JSON.stringify(planned.volumes.map(volume => [volume.volume, volume.chapters.length])))
+check('卷名从卷纲 frontmatter 读出来，进工程树',
+  planned.volumes[1]?.title === '北境篇' && planned.volumes[0]?.title === undefined)
+check('计划中的卷不进章节计数（它没有章节）', planned.chapterCount === 1)
+
+await volumeIo.createChapter(volumeScope, { volume: 1, title: '第二章' })
+const firstOfSecond = await volumeIo.createChapter(volumeScope, { volume: 2, title: '北境篇·第一章' })
+check('新卷的第一章接着全书章号（第 3 章，不是第 1 章）——id 才不会撞上第一卷第 1 章',
+  firstOfSecond.number === 3 && firstOfSecond.id === 'c0003' && firstOfSecond.path === 'chapters/v02/c0003.md',
+  `${firstOfSecond.path} number=${String(firstOfSecond.number)}`)
+const afterSecond = await volumeIo.createChapter(volumeScope, { volume: 1, title: '第一卷第三章' })
+check('回到第一卷建章也接着全书章号（第 4 章）', afterSecond.number === 4 && afterSecond.path === 'chapters/v01/c0004.md')
+const twoVolumeSnapshot = await volumeIo.snapshot(volumeScope)
+check('两卷各自的章节都在自己的卷里',
+  twoVolumeSnapshot.volumes.map(volume => `${String(volume.volume)}:${String(volume.chapters.length)}`).join() === '1:3,2:1'
+  && twoVolumeSnapshot.volumes[1]?.title === '北境篇')
+const namedExport = await volumeIo.exportBook(volumeScope, { format: 'md', scope: 'book', at: '2026-01-01T00:00:00.000Z' })
+check('导出的卷标题用作者起的卷名（没起名的只有卷号）',
+  namedExport.text.includes('## 第 2 卷 · 北境篇') && namedExport.text.includes('## 第 1 卷\n'),
+  namedExport.text.slice(0, 160))
 
 console.log('\n--- 检索（host 侧：一次扫描，读的是文件系统） ---')
 await io.writeChapter(scope, 'chapters/v01/c0005.md', {
@@ -2522,6 +2649,89 @@ check('每个动作都能印出它的键（按钮提示与行为同源，不会�
   && new Set(KEY_BINDINGS.map(binding => binding.keys)).size === KEY_BINDINGS.length)
 check('没有一个是「无修饰键的可打印字符」（否则它会在正文里吃掉一个按键）',
   KEY_BINDINGS.every(binding => binding.ctrl === true || binding.alt === true || binding.key === 'Escape'))
+
+// ---------------------------------------------------------------------------
+// 工程记忆落盘（作者报「打开过的那排按钮没了」之后加的）。
+//
+// 症状的根因不是丢数据，是那份记忆当时只活在 `localStorage` 里，而它按 origin
+// 分桶——GUI 换个端口，看到的就是空列表（旧数据还在旧端口那个桶下面）。所以
+// 权威副本搬到 host 的文件里，下面这些断言钉住三件最要紧的事：**去重要认路径的
+// 两种写法**（否则同一本书会出现两个按钮）、**信封缺了也不能把列表吃掉**（否则
+// 一次手改文件就让整排按钮消失）、**写不进去要说出来而不是假装成功**（否则作者
+// 又要在下次换端口时重新撞一遍）。
+console.log('\n--- 工程记忆：host 侧落盘 ---')
+const { mkdtempSync: mkdtempRecents, readFileSync: readRecentsFile, rmSync: rmRecents } = await import('node:fs')
+const { tmpdir: tmpdirRecents } = await import('node:os')
+const { join: joinRecents } = await import('node:path')
+const {
+  loadRecents: loadHostRecents,
+  mergeRecent,
+  parseStoredRecents,
+  recentsFile: recentsFileOf,
+  rememberRecent,
+  stateDirectory,
+} = await import('../src/novel/recents.ts')
+const { mergeRecents } = await import('../src/client/projects.ts')
+
+const recentsDir = mkdtempRecents(joinRecents(tmpdirRecents(), 'novel-recents-'))
+const recentsPath = joinRecents(recentsDir, 'recent-projects.json')
+const opened = (root, title, at) => ({ root, title, at })
+
+check('同一条路径的两种写法是同一个工程（大小写、尾斜杠、\\\\?\\ 前缀）',
+  mergeRecent([opened('C:\\Books\\WuMing', '旧', 1)], opened('c:/books/wuming/', '新', 2))
+    .map(item => item.title).join() === '新')
+check('没写过就是「没有记忆」，不是报错',
+  loadHostRecents(recentsPath).length === 0)
+// 每一步都先执行、再断言：写成 `A && rememberRecent(...) && B` 的话，A 一旦不成立，
+// 那次写入就被短路吞掉，后面的断言全部连锁失败——测试自己变成了「不报错但什么都没做」。
+const wroteFirst = rememberRecent(opened('/a', '甲', 1), recentsPath)
+check('写进去的能读回来',
+  Array.isArray(wroteFirst) && loadHostRecents(recentsPath).map(item => item.root).join() === '/a',
+  JSON.stringify(loadHostRecents(recentsPath)))
+const wroteSecond = rememberRecent(opened('/b', '乙', 2), recentsPath)
+check('第二条按最新在前排',
+  wroteSecond?.length === 2 && loadHostRecents(recentsPath).map(item => item.root).join() === '/b,/a',
+  JSON.stringify(loadHostRecents(recentsPath)))
+const wroteAgain = rememberRecent(opened('/a', '甲改名', 9), recentsPath)
+check('同一本书再打开一次不会多出一个按钮，书名跟着更新',
+  wroteAgain?.map(item => item.root).join() === '/a,/b' && loadHostRecents(recentsPath)[0].title === '甲改名',
+  JSON.stringify(loadHostRecents(recentsPath)))
+const capped = Array.from({ length: 12 }, (_, index) =>
+  rememberRecent(opened(`/p${String(index)}`, 'x', index + 100), recentsPath))
+// 头几条还没到上限，所以不能对每一条都要求整 8——要钉的是**最后**那条：满员之后
+// 进来的挤掉最旧的，而且文件里落的就是面板拿到的那一份。
+check('上限挤掉最旧的，且文件里落的是同样的列表',
+  capped.at(-1)?.length === 8
+  && capped.at(-1).map(item => item.root).join() === '/p11,/p10,/p9,/p8,/p7,/p6,/p5,/p4'
+  && JSON.parse(readRecentsFile(recentsPath, 'utf8')).projects.length === 8,
+  capped.map(list => (list === undefined ? 'undefined' : String(list.length))).join(','))
+check('文件被手改成坏值只丢记忆，不留半个列表',
+  parseStoredRecents('这不是 JSON').length === 0
+  && parseStoredRecents('{"version":1,"projects":"不是数组"}').length === 0
+  && parseStoredRecents(JSON.stringify([{ root: '', title: 'x', at: 1 }, { root: '/ok', title: '甲', at: 2 }]))
+    .map(item => item.root).join() === '/ok')
+check('手写的裸数组也认（人打开这个文件时写的是列表，不是信封）',
+  parseStoredRecents(JSON.stringify([opened('/bare', '乙', 3)])).map(item => item.root).join() === '/bare')
+check('写不进去时返回 undefined（面板据此说出「记忆只剩浏览器这一份」）',
+  rememberRecent(opened('/a', '甲', 1), joinRecents(recentsDir, 'no<such>dir', 'x.json')) === undefined)
+check('存档路径由 DSH_HOME 决定，不是随手扔在 cwd',
+  recentsFileOf().startsWith(stateDirectory())
+  && (process.env.DSH_HOME === undefined || recentsFileOf().startsWith(process.env.DSH_HOME)))
+
+console.log('\n--- 工程记忆：host 与浏览器两份合并 ---')
+check('两份合起来看，host 是权威、浏览器那份只是并进来',
+  mergeRecents([opened('/host', '甲', 5), opened('/both', '新', 9)], [opened('/browser', '乙', 3), opened('/both', '旧', 1)])
+    .map(item => `${item.root}:${item.title}`).join() === '/both:新,/host:甲,/browser:乙')
+check('同一工程两份都在时，谁记得更新就用谁（改名两边都认）',
+  mergeRecents([opened('/a', '新名', 1)], [opened('/a', '旧名', 8)])[0].title === '旧名'
+  && mergeRecents([opened('/a', '新名', 8)], [opened('/a', '旧名', 1)])[0].title === '新名')
+check('合并也有上限，两边都空时不炸',
+  mergeRecents(
+    Array.from({ length: 6 }, (_, index) => opened(`/h${String(index)}`, 'x', index + 100)),
+    Array.from({ length: 6 }, (_, index) => opened(`/b${String(index)}`, 'y', index + 100)),
+  ).length === 8
+  && mergeRecents([], []).length === 0)
+rmRecents(recentsDir, { recursive: true, force: true })
 
 // ---------------------------------------------------------------------------
 // P5: 错误处理。两句话必须能被作者拿去做决定：连不上 host 时说什么、失败能不能重来。

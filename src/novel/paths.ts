@@ -98,6 +98,28 @@ export function volumeOutlinePath(volume: number): string {
 }
 
 /**
+ * The skeleton a volume outline starts with (format §4.11).
+ *
+ * One shape for both writers — the project scaffolder (`project.ts`) and the
+ * panel's 「新建卷」 — so a volume created from the panel is byte-identical to the
+ * one a new project starts with. The volume's **name** is deliberately not in
+ * here: it is an optional `title` the author adds, and pre-filling it would put
+ * 「第 2 卷」 in the file as if it were a name.
+ * @param volume - the volume number.
+ * @returns the initial Markdown.
+ */
+export function volumeOutlineSkeleton(volume: number): string {
+  return [
+    `# 第 ${String(volume)} 卷`,
+    '',
+    '## 卷目标',
+    '## 卷冲突',
+    '## 卷末状态',
+    '',
+  ].join('\n')
+}
+
+/**
  * Whether a string is usable as a card id.
  *
  * The format fixes ids to lowercase ASCII slugs (`chen-mo`, `qingshi-town`),

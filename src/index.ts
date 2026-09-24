@@ -11,6 +11,7 @@
  */
 import { NOVEL_ROUTES, ROUTE_PING, createHandlers } from './novel/http.ts'
 import { NovelIo } from './novel/io.ts'
+import { loadRecents, rememberRecent } from './novel/recents.ts'
 import { runState, startWritingRun } from './novel/writing.ts'
 
 /** Cordis plugin name. */
@@ -61,6 +62,10 @@ export function apply(ctx: any): void {
     defaultRoot: defaultRootFor(ctx, undefined),
     startWritingRun: (sessionId, prompt, label) => startWritingRun(ctx, sessionId, prompt, label),
     runState,
+    // The panel's memory of opened projects lives on disk rather than in the
+    // browser's per-origin storage; see `novel/recents.ts` for why.
+    loadRecents: () => loadRecents(),
+    rememberRecent: entry => rememberRecent(entry),
   })
 
   // Ping is the one route whose answer depends on the caller, so it is wrapped

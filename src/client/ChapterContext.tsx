@@ -56,6 +56,7 @@ export function ChapterContext({ env, volumes, openPath, attached, onAttach, onD
   const options = volumes
     .map(volume => ({
       volume: volume.volume,
+      ...(volume.title === undefined ? {} : { title: volume.title }),
       chapters: volume.chapters.filter(chapter => !chapter.archived && chapter.path !== openPath),
     }))
     .filter(group => group.chapters.length > 0)
@@ -102,7 +103,12 @@ export function ChapterContext({ env, volumes, openPath, attached, onAttach, onD
         >
           <option value="">＋ 加章节…</option>
           {options.map(group => (
-            <optgroup key={group.volume} label={`第 ${String(group.volume)} 卷`}>
+            <optgroup
+              key={group.volume}
+              label={group.title === undefined || group.title.trim() === ''
+                ? `第 ${String(group.volume)} 卷`
+                : `第 ${String(group.volume)} 卷 · ${group.title}`}
+            >
               {group.chapters.map(chapter => {
                 const isAttached = attached.includes(chapter.id)
                 return (

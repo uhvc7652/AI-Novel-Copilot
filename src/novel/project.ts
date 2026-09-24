@@ -33,6 +33,8 @@ import {
   cardIdOfPath,
   cardTypeOfPath,
   volumeDir,
+  volumeOutlinePath,
+  volumeOutlineSkeleton,
   type CardType,
 } from './paths.ts'
 import { countWords } from './words.ts'
@@ -120,8 +122,24 @@ export interface VolumeSummary {
   dir: string
   /** Volume number derived from the directory name. */
   volume: number
+  /**
+   * The volume's name, from its outline's frontmatter `title` (format §4.11).
+   *
+   * Absent when the author has not named the volume: 「第 N 卷」 is then the whole
+   * label, and inventing one here would put a name into every prompt and every
+   * export that the author never wrote.
+   */
+  title?: string
   /** Chapters in this volume, ascending by number. */
   chapters: ChapterSummary[]
+}
+
+/** One volume as the outline directory reports it. */
+export interface VolumeOutline {
+  /** Volume number the filename encodes, e.g. `v02` → 2. */
+  volume: number
+  /** The outline's frontmatter `title`, when it has one. */
+  title?: string
 }
 
 /** Everything the panel needs to draw the project tree. */
@@ -369,6 +387,48 @@ export function groupVolumes(chapters: readonly ChapterSummary[]): VolumeSummary
 }
 
 /**
+ * The book's volumes, from both sources that can create one.
+ *
+ * **A volume exists when its outline file does, not only when it has chapters.**
+ * That is the whole point of being able to plan ahead: the author lays out 第二卷
+ * (its 卷目标, 卷冲突, 卷末状态) before writing a word of it, and every surface
+ * that offers a volume — the outline page, the chapter tree, the export scope, a
+ * task's 「本卷」 — has to be able to see it in the meantime. Deriving volumes from
+ * `chapters/vNN/` alone, which is what the tree used to do, made a planned volume
+ * invisible until its first chapter existed, and there was no way to create that
+ * chapter *into* it either.
+ *
+ * The chapter side wins when both know about a volume; only the name comes from
+ * the outline.
+ * @param chapters - every chapter summary, archived ones included.
+ * @param outlines - every volume outline that exists on disk.
+ * @returns volumes ascending by number, each carrying its chapters and its name.
+ */
+export function mergeVolumes(
+  chapters: readonly ChapterSummary[],
+  outlines: readonly VolumeOutline[],
+): VolumeSummary[] {
+  const merged = new Map<number, VolumeSummary>()
+  for (const volume of groupVolumes(chapters)) {
+    merged.set(volume.volume, volume)
+  }
+  for (const outline of outlines) {
+    const existing = merged.get(outline.volume)
+    if (existing === undefined) {
+      merged.set(outline.volume, {
+        dir: volumeDir(outline.volume),
+        volume: outline.volume,
+        ...(outline.title === undefined ? {} : { title: outline.title }),
+        chapters: [],
+      })
+    } else if (outline.title !== undefined) {
+      existing.title = outline.title
+    }
+  }
+  return [...merged.values()].sort((left, right) => left.volume - right.volume)
+}
+
+/**
  * Total measured words across a project.
  * @param volumes - grouped chapters.
  * @returns the sum of every chapter's word count.
@@ -381,15 +441,23 @@ export function totalWords(volumes: readonly VolumeSummary[]): number {
 }
 
 /**
- * The next unused chapter number in a volume.
- * @param volumes - grouped chapters.
- * @param volume - the volume to append to.
- * @returns one past the highest chapter number in that volume, or 1.
+ * The next free chapter number — **for the whole book**, not for one volume.
+ *
+ * Chapter numbers run continuously across volumes (format §3.1): 第三卷第一章 is
+ * 第 3 章 when the first two volumes hold two chapters. That is what keeps a
+ * chapter's id (`c0003`, derived from its number) unique, and ids are what every
+ * reference in the project points at — a per-volume restart would mint a second
+ * `c0001` in 第二卷 and make 伏笔's `plantedIn`, the timeline and 参考章节 ambiguous
+ * about which chapter they mean.
+ *
+ * Archived chapters count: they keep their number (format §4.6), so the number
+ * they hold is not free.
+ * @param volumes - every volume, chapters included, outlines included.
+ * @returns one past the highest chapter number in the book, or 1.
  */
-export function nextChapterNumber(volumes: readonly VolumeSummary[], volume: number): number {
-  const existing = volumes.find(item => item.volume === volume)
-  if (existing === undefined || existing.chapters.length === 0) return 1
-  return Math.max(...existing.chapters.map(chapter => chapter.number)) + 1
+export function nextChapterNumber(volumes: readonly VolumeSummary[]): number {
+  const numbers = volumes.flatMap(volume => volume.chapters.map(chapter => chapter.number))
+  return numbers.length === 0 ? 1 : Math.max(...numbers) + 1
 }
 
 /**
@@ -694,15 +762,10 @@ export function scaffoldFiles(title: string): ScaffoldFile[] {
       ].join('\n'),
     },
     {
-      path: 'outline/volumes/v01.md',
-      content: [
-        '# 第一卷',
-        '',
-        '## 卷目标',
-        '## 卷冲突',
-        '## 卷末状态',
-        '',
-      ].join('\n'),
+      path: volumeOutlinePath(1),
+      // The same skeleton the panel's 「新建卷」 writes (`paths.ts`): a project
+      // scaffolded today and a volume added tomorrow must look alike.
+      content: volumeOutlineSkeleton(1),
     },
     {
       path: 'style/style-guide.md',

@@ -29,6 +29,7 @@ import { ExportView } from './ExportView.tsx'
 import { OutlineView } from './OutlineView.tsx'
 import {
   loadRecents,
+  mergeRecents,
   recentLabel,
   rememberProject,
   saveRecents,
@@ -43,6 +44,7 @@ import { HistoryView } from './HistoryView.tsx'
 import { TaskBar } from './TaskBar.tsx'
 import { ChapterCards } from './ChapterCards.tsx'
 import { ChapterContext } from './ChapterContext.tsx'
+import { createNextVolume, createdVolumeNote, nextVolumeNumber } from './volumes.ts'
 import { CHAPTER_TASKS, CHECK_TASKS, type TaskContext } from './tasks.ts'
 import {
   box,
@@ -206,6 +208,14 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   const [titleDraft, setTitleDraft] = useState('')
   /** Projects the author has opened before, newest first. */
   const [recents, setRecents] = useState<RecentProject[]>([])
+  /**
+   * Whether the remembered list reached the host's file.
+   *
+   * `undefined` before the first write. False is worth telling the author about,
+   * once, because it is exactly the state in which the list will be empty after
+   * a changed page origin — the complaint this whole route exists to fix.
+   */
+  const [recentsStored, setRecentsStored] = useState<boolean>()
   /** Whether retired chapters are listed in the tree. */
   const [showArchived, setShowArchived] = useState(false)
   /** A card the retrieval view asked the settings surface to open. */
@@ -295,10 +305,34 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
    */
   const [provenance, setProvenance] = useState<string>()
 
-  /** Replace the remembered list, in state and in storage together. */  const storeRecents = useCallback((next: RecentProject[]) => {
+  /** Replace the remembered list, in state and in storage together. */
+  const storeRecents = useCallback((next: RecentProject[], stored?: boolean) => {
     recentsRef.current = next
     setRecents(next)
     saveRecents(next)
+    if (stored !== undefined) setRecentsStored(stored)
+  }, [])
+
+  /**
+   * Fold the host's list into the panel's, once, at mount.
+   *
+   * The host's file is the copy that survives a changed page origin, so it wins
+   * where the two disagree; the browser's copy is unioned in because it is the
+   * only one that exists when the host cannot write its home directory. Both
+   * halves are visible in the result, which is the point: neither is dropped
+   * silently.
+   *
+   * A failure here is deliberately not surfaced as an error. The panel already
+   * has a usable list from the browser; a status line saying the *memory* could
+   * not be read would be alarming and actionable-by-nobody, and the author's
+   * next open retries it anyway.
+   */
+  const syncRecents = useCallback(async (): Promise<RecentProject[]> => {
+    try {
+      return mergeRecents(await api.readRecents(), recentsRef.current)
+    } catch {
+      return recentsRef.current
+    }
   }, [])
 
   const rememberRoot = useCallback((value: string) => {
@@ -455,7 +489,22 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     // A report belongs to the project it was run against.
     setCheckReport(undefined)
     checkedRef.current = false
-    storeRecents(rememberProject(recentsRef.current, { root: target, title: next.title, at: Date.now() }))
+    // The browser's copy is written first and synchronously — it is what makes
+    // the next paint (and a host that cannot write) correct — and the host's copy
+    // is written after, optimistically: the author is already looking at the
+    // opened book, and a bookkeeping write must not hold the status line.
+    const entry: RecentProject = { root: target, title: next.title, at: Date.now() }
+    storeRecents(rememberProject(recentsRef.current, entry))
+    void api.rememberRecentProject(entry).then(
+      // The host answers with the list as it wrote it, so the panel adopts that
+      // rather than its own guess: a dedupe or a cap applied there is what the
+      // next launch will read back.
+      written => { storeRecents(mergeRecents(written.entries, recentsRef.current), written.stored) },
+      // Unreachable in a healthy deployment (the route degrades instead of
+      // failing); if it ever happens, the browser's copy still holds the list,
+      // and the panel says the memory is not durable rather than pretending.
+      () => { setRecentsStored(false) },
+    )
     // The card library is a second read; failing it must not fail the open — but
     // it must not vanish either, so the reason goes to the picker's note.
     void api.readCards(sessionId ?? '', target).then(
@@ -470,20 +519,29 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
   // The panel is the front door to a long book, so it reopens the last project
   // by itself. Only a project that was actually opened is restored — a path that
   // was typed and never read stays text, and never turns into an error on mount.
+  //
+  // The list is read from **two** places, and the order matters: the browser's
+  // cache is synchronous (so the buttons are on screen immediately, which is what
+  // it exists for), and the host's file is merged in as soon as it answers — it
+  // is the copy that survives a changed page origin. Auto-open waits for the
+  // merge, because the host may know a book this origin has never heard of, and
+  // opening the wrong one is worse than opening a moment later.
   useEffect(() => {
     if (restoredRef.current) return
     restoredRef.current = true
-    const remembered = loadRecents()
-    storeRecents(remembered)
+    storeRecents(loadRecents())
     try {
       const typed = globalThis.localStorage?.getItem(ROOT_STORAGE_KEY)
       if (typed !== null && typed !== undefined && typed !== '') setRoot(typed)
     } catch {
       // A blocked storage API is not worth failing the panel over.
     }
-    const last = remembered[0]
-    if (last !== undefined) void run('打开上次的工程', async () => await openRoot(last.root))
-  }, [openRoot, run, storeRecents])
+    void syncRecents().then(merged => {
+      storeRecents(merged)
+      const last = merged[0]
+      if (last !== undefined) void run('打开上次的工程', async () => await openRoot(last.root))
+    })
+  }, [openRoot, run, storeRecents, syncRecents])
 
   // The title box mirrors the project until the author edits it.
   useEffect(() => {
@@ -969,12 +1027,40 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     })
   }, [projectRoot, refresh, run, sessionId, titleDraft])
 
-  const onAddChapter = useCallback(() => {
+  /**
+   * Create the next volume (the chapter tree's 「＋ 新建卷」).
+   *
+   * Deliberately next to 「＋ 新建章节」: the volumes *are* the rows below that
+   * button, so this is where the author looks for "make another one". What it
+   * writes is the volume outline skeleton and nothing else — no directory, no
+   * empty chapter — and the write itself is shared with the outline page
+   * (`client/volumes.ts`), so both buttons cannot drift apart.
+   */
+  const onAddVolume = useCallback(() => {
+    const target = projectRoot('新建卷')
+    if (target === undefined) return
+    const volumes = snapshot?.volumes ?? []
+    void run('新建卷', async () => {
+      const created = await createNextVolume(sessionId ?? '', target, volumes)
+      await refresh(target)
+      return `${createdVolumeNote(created)}（在大纲页写它的卷纲，或用「续写卷纲」生成）`
+    })
+  }, [projectRoot, refresh, run, sessionId, snapshot])
+
+  /**
+   * Add a chapter to one volume.
+   *
+   * The volume is a parameter rather than "the last one": with more than one
+   * volume open for business — including a planned volume that has no chapters
+   * yet (format §4.11) — "which volume am I adding to" is exactly the question
+   * this button has to answer, and the tree answers it by putting one of these
+   * on each volume's header.
+   */
+  const onAddChapter = useCallback((volumeNumber: number) => {
     const target = projectRoot('新建章节')
     if (target === undefined) return
     void run('新建章节', async () => {
-      const volume = snapshot?.volumes.at(-1)?.volume ?? 1
-      const created = await api.createChapter(sessionId ?? '', target, { volume, title: '新章节' })
+      const created = await api.createChapter(sessionId ?? '', target, { volume: volumeNumber, title: '新章节' })
       await refresh(target)
       const loaded = await api.readChapter(sessionId ?? '', target, created.path)
       const next: OpenChapter = { path: loaded.path, data: loaded.data, body: loaded.body }
@@ -982,7 +1068,7 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
       setOriginal({ ...next, data: { ...next.data } })
       return `已新建 ${created.path}`
     })
-  }, [projectRoot, refresh, run, sessionId, snapshot])
+  }, [projectRoot, refresh, run, sessionId])
 
   /**
    * Retire the open chapter, or put it back.
@@ -1214,6 +1300,12 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
       </div>
 
       {/* One button per project the author has opened before, newest first. */}
+      {recentsStored === false && (
+        <div style={{ ...caption, fontSize: 11 }}>
+          工程记忆没能写进 host 的存档（只剩这个浏览器地址下的一份）；换个端口打开 GUI 时这排按钮就会是空的。
+          检查 DSH_HOME 目录是否可写。
+        </div>
+      )}
       {recents.length > 0 && (
         <div style={{ ...row, fontSize: 11 }}>
           <span style={caption}>打开过：</span>
@@ -1296,7 +1388,28 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
                   >
                     改名
                   </button>
-                  <button type="button" style={button} disabled={busy} onClick={onAddChapter}>+ 新建章节</button>
+                  {/* 卷也能在这里建：卷就是下面这些行，作者在这儿找它是自然的。
+                      写的是 `outline/volumes/vNN.md` 骨架（与大纲页的按钮同一个
+                      `createNextVolume`），所以这一卷立刻出现在卷列表里——还没有
+                      任何章节也没关系（格式 §4.11）。 */}
+                  <button
+                    type="button"
+                    style={button}
+                    disabled={busy}
+                    title={`新建第 ${String(nextVolumeNumber(snapshot.volumes))} 卷（写它的卷纲骨架，还不用有章节）`}
+                    onClick={onAddVolume}
+                  >
+                    ＋ 新建卷
+                  </button>
+                  <button
+                    type="button"
+                    style={button}
+                    disabled={busy}
+                    title="加到最后一卷；要加到别的卷，点那一卷标题右边的 ＋"
+                    onClick={() => { onAddChapter(snapshot.volumes.at(-1)?.volume ?? 1) }}
+                  >
+                    + 新建章节
+                  </button>
                 </span>
               </div>
               <div style={{ ...row, justifyContent: 'space-between' }}>
@@ -1319,37 +1432,55 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
               </div>
               {snapshot.volumes.map(volume => {
                 const chapters = volume.chapters.filter(chapter => showArchived || !chapter.archived)
-                if (chapters.length === 0) return null
+                const words = chapters.reduce((sum, item) => sum + item.wordCount, 0)
                 return (
                   <div key={volume.dir} style={{ marginTop: 6 }}>
-                    <div style={metaLine}>
-                      第 {String(volume.volume)} 卷 · {String(chapters.length)} 章 ·
-                      {' '}{String(chapters.reduce((sum, item) => sum + item.wordCount, 0))} 字
-                    </div>
-                    {chapters.map(chapter => (
+                    <div style={{ ...row, justifyContent: 'space-between' }}>
+                      <span style={metaLine}>
+                        第 {String(volume.volume)} 卷
+                        {volume.title === undefined || volume.title.trim() === '' ? '' : ` · ${volume.title}`}
+                        {' · '}
+                        {chapters.length === 0 ? '还没有章节' : `${String(chapters.length)} 章 · ${String(words)} 字`}
+                      </span>
+                      {/* 一卷一条新建入口：卷可以是「已经计划好、还没有章节」的
+                          （卷纲存在即成立，格式 §4.11），所以「加到哪一卷」必须
+                          由这一卷自己回答，而不是猜「最后一卷」。 */}
                       <button
-                        key={chapter.path}
                         type="button"
-                        title={chapter.archived ? `${chapter.path}（已存档，可恢复）` : chapter.path}
-                        style={{
-                          ...listRow,
-                          background: open?.path === chapter.path
-                            ? 'color-mix(in srgb, currentColor 12%, transparent)'
-                            : 'transparent',
-                          opacity: chapter.archived ? 0.5 : 1,
-                        }}
-                        onClick={() => { onSelect(chapter) }}
+                        style={{ ...button, padding: '1px 6px', fontSize: 11 }}
+                        disabled={busy}
+                        title={`在第 ${String(volume.volume)} 卷末尾新建一章（章号在全书中连续）`}
+                        onClick={() => { onAddChapter(volume.volume) }}
                       >
-                        <span>
-                          第 {String(chapter.number)} 章 {chapter.title}
-                          {chapter.archived ? ' · 已存档' : ''}
-                        </span>
-                        <span style={{ opacity: 0.65 }}>
-                          {STATUS_LABEL[chapter.status]} · {String(chapter.wordCount)} 字
-                          {chapter.beats.length === 0 ? '' : ` · 要点 ${String(chapter.beats.length)}`}
-                        </span>
+                        ＋ 新建章节
                       </button>
-                    ))}
+                    </div>
+                    {chapters.length === 0
+                      ? <div style={metaLine}>这一卷还没有章节——点上面的「＋ 新建章节」，或在大纲页用「按卷纲拆章」。</div>
+                      : chapters.map(chapter => (
+                        <button
+                          key={chapter.path}
+                          type="button"
+                          title={chapter.archived ? `${chapter.path}（已存档，可恢复）` : chapter.path}
+                          style={{
+                            ...listRow,
+                            background: open?.path === chapter.path
+                              ? 'color-mix(in srgb, currentColor 12%, transparent)'
+                              : 'transparent',
+                            opacity: chapter.archived ? 0.5 : 1,
+                          }}
+                          onClick={() => { onSelect(chapter) }}
+                        >
+                          <span>
+                            第 {String(chapter.number)} 章 {chapter.title}
+                            {chapter.archived ? ' · 已存档' : ''}
+                          </span>
+                          <span style={{ opacity: 0.65 }}>
+                            {STATUS_LABEL[chapter.status]} · {String(chapter.wordCount)} 字
+                            {chapter.beats.length === 0 ? '' : ` · 要点 ${String(chapter.beats.length)}`}
+                          </span>
+                        </button>
+                      ))}
                   </div>
                 )
               })}

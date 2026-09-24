@@ -27,6 +27,7 @@ import {
 } from './io.ts'
 import type { CardType, ProjectSnapshot } from './project.ts'
 import { CARD_TYPES } from './project.ts'
+import type { RecentProject } from './recents.ts'
 import type { WritingRun } from './writing.ts'
 
 /** Absolute route paths this plugin owns. */
@@ -46,6 +47,14 @@ export const ROUTE_TEXT = '/api/novel/text'
 export const ROUTE_META = '/api/novel/meta'
 export const ROUTE_RUN = '/api/novel/run'
 export const ROUTE_TASK = '/api/novel/task'
+/**
+ * The remembered projects.
+ *
+ * Not a novel operation: it touches no book. It is here because the panel's
+ * memory of "which books I opened" has to outlive the page origin, and the
+ * browser is the only place that cannot promise that (see `novel/recents.ts`).
+ */
+export const ROUTE_RECENTS = '/api/novel/recents'
 
 /** Every route path, in registration order. */
 export const NOVEL_ROUTES = [
@@ -63,6 +72,7 @@ export const NOVEL_ROUTES = [
   ROUTE_META,
   ROUTE_RUN,
   ROUTE_TASK,
+  ROUTE_RECENTS,
 ] as const
 
 /** One route path this plugin owns. */
@@ -280,6 +290,18 @@ export interface HandlerDeps {
    * @returns its state, or undefined for an unknown run.
    */
   runState(runId: string): WritingRun | undefined
+  /**
+   * Read the projects the author has opened before.
+   * @returns the entries, newest first; empty when there is no memory or none can
+   *   be read.
+   */
+  loadRecents(): RecentProject[]
+  /**
+   * Remember one project.
+   * @param entry - the project just opened.
+   * @returns the new list, or undefined when it could not be written.
+   */
+  rememberRecent(entry: RecentProject): RecentProject[] | undefined
 }
 
 /**
@@ -676,6 +698,47 @@ export function createHandlers(deps: HandlerDeps): NovelHandlers {
     }
   }
 
+  /**
+   * The panel's memory of which books were opened.
+   *
+   * A `GET` answers the whole list, and a `POST` records one open and answers
+   * the list as it was written — the panel keeps that answer rather than
+   * guessing, so the two copies cannot drift.
+   *
+   * **A write that cannot happen is not an error here.** This route exists so
+   * that a memory survives a changed page origin; a deployment whose home
+   * directory is read-only still works, it just falls back to the browser's
+   * copy. Answering 500 would turn a degraded convenience into a failed open.
+   */
+  const recents = async (request: Request): Promise<Response> => {
+    try {
+      if (request.method === 'GET' || request.method === 'HEAD') {
+        const entries = deps.loadRecents()
+        if (request.method === 'HEAD') return new Response(null, { status: 200 })
+        return json(200, { ok: true, recents: { entries } })
+      }
+      const body = await readJson(request)
+      const entry: RecentProject = {
+        root: requireField(body, 'root'),
+        title: typeof body.title === 'string' ? body.title : '',
+        at: typeof body.at === 'number' && Number.isFinite(body.at) ? body.at : Date.now(),
+      }
+      const written = deps.rememberRecent(entry)
+      return json(200, {
+        ok: true,
+        recents: {
+          entries: written ?? deps.loadRecents(),
+          // The panel needs to tell "remembered for good" apart from "remembered
+          // only in this browser", because that is the difference between the
+          // memory surviving the next launch and not.
+          stored: written !== undefined,
+        },
+      })
+    } catch (error) {
+      return toFailure(error)
+    }
+  }
+
   return {
     [ROUTE_PING]: ping,
     [ROUTE_PROJECT]: project,
@@ -691,5 +754,6 @@ export function createHandlers(deps: HandlerDeps): NovelHandlers {
     [ROUTE_META]: meta,
     [ROUTE_RUN]: run,
     [ROUTE_TASK]: task,
+    [ROUTE_RECENTS]: recents,
   }
 }

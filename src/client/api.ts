@@ -20,6 +20,7 @@ import type { CardSummary, ChapterSummary, ProjectSnapshot } from '../novel/proj
 import type { DiffLine, HistoryEntry, HistorySource, HistorySummary } from '../novel/history.ts'
 import type { SearchResult } from '../novel/search.ts'
 import type { CheckReport } from '../novel/checks.ts'
+import type { RecentProject } from '../novel/recents.ts'
 
 /** Route prefix owned by this plugin's host half. */
 const BASE = '/api/novel'
@@ -364,6 +365,37 @@ export async function revertHistory(
     post({ sessionId, root, path, at, action: 'revert' }),
   )
   return value.document
+}
+
+/**
+ * Read the projects the host remembers.
+ *
+ * This is the durable half of the panel's 「打开过」 list: the host keeps it in a
+ * file under its own home, so it does not depend on which port the panel was
+ * served from the way `localStorage` does.
+ * @returns the entries, newest first.
+ */
+export async function readRecents(): Promise<RecentProject[]> {
+  const value = await call<Envelope & { recents: { entries: RecentProject[] } }>(`${BASE}/recents`)
+  return value.recents.entries
+}
+
+/**
+ * Record one opened project, on the host.
+ *
+ * The host answers with the list as it actually wrote it, which is what the
+ * panel stores — so a rename or a dedupe cannot drift between the two copies.
+ * @param entry - the project just opened.
+ * @returns the new list, and whether it reached disk.
+ */
+export async function rememberRecentProject(
+  entry: RecentProject,
+): Promise<{ entries: RecentProject[], stored: boolean }> {
+  const value = await call<Envelope & { recents: { entries: RecentProject[], stored: boolean } }>(
+    `${BASE}/recents`,
+    post(entry),
+  )
+  return value.recents
 }
 
 /**

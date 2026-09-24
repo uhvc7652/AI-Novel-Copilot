@@ -11,24 +11,35 @@
  * throwing. The parsing is deliberately total — a hand-edited or truncated value
  * yields an empty list, never a broken panel.
  *
+ * ## This is the cache, not the memory
+ *
+ * `localStorage` is keyed by page origin, and the panel is served on whatever
+ * port DSH was started with — so the same book on a different port produced an
+ * empty list. The authoritative copy is the host's file
+ * (`novel/recents.ts`); what lives here is the copy that makes the first paint
+ * instant and survives a host that cannot write. {@link mergeRecents} folds the
+ * two together, and the panel shows that.
+ *
  * @module dsh-ai-novel-copilot/client/projects
  */
 
-/** One project the author has opened. */
-export interface RecentProject {
-  /** Absolute project root. */
-  root: string
-  /** Book title as the project reported it at open time. */
-  title: string
-  /** When it was last opened, in epoch milliseconds. */
-  at: number
-}
+/**
+ * One project the author has opened.
+ *
+ * Re-exported from the shared, dependency-free module both halves read, so the
+ * two cannot drift apart. It deliberately does **not** come from
+ * `novel/recents.ts`: that module touches `node:fs`, and this file is bundled
+ * for the browser (README lesson 8).
+ */
+export type { RecentProject } from '../novel/recents-key.ts'
+import type { RecentProject } from '../novel/recents-key.ts'
+import { RECENTS_LIMIT, projectKey } from '../novel/recents-key.ts'
 
 /** Storage key holding the recent list. */
 export const RECENTS_KEY = 'dsh-ai-novel-copilot.projects'
 
-/** How many projects to remember. */
-export const RECENTS_LIMIT = 8
+/** How many projects to remember — re-exported, so both halves cap the same. */
+export { RECENTS_LIMIT }
 
 /** The slice of Web Storage this module uses. */
 export interface RecentStorage {
@@ -49,7 +60,46 @@ export function browserStorage(): RecentStorage | undefined {
   }
 }
 
-/** Whether a parsed value is a usable entry. */
+/**
+ * Fold the host's list and the browser's cached list into the one to show.
+ *
+ * Neither side may win outright, and that is the whole point of the function:
+ *
+ * - **The host file is authoritative**, because it is the copy that does not
+ *   depend on which port the panel was served from.
+ * - **The browser's copy is still unioned in**, because it is the only thing
+ *   that survives a host that cannot write its home directory, and it is what
+ *   the panel shows before the host has answered.
+ *
+ * Duplicates are folded by `root`, keeping whichever side recorded it more
+ * recently (so a rename is picked up from either side), and the result is capped
+ * like every other write. A path is normalised before comparing for the same
+ * reason as the host's dedupe: two spellings of one directory are one project.
+ * @param host - the entries the host remembered.
+ * @param browser - the entries the browser cached.
+ * @param limit - how many entries to keep.
+ * @returns the merged list, newest first.
+ */
+export function mergeRecents(
+  host: readonly RecentProject[],
+  browser: readonly RecentProject[],
+  limit: number = RECENTS_LIMIT,
+): RecentProject[] {
+  const folded = new Map<string, RecentProject>()
+  // The browser's list goes in first so that the host's entry of the same
+  // project overwrites it only on `at` — not on iteration order, which would
+  // make the outcome depend on which side was passed first.
+  for (const entry of [...browser, ...host]) {
+    const at = projectKey(entry.root)
+    const current = folded.get(at)
+    if (current === undefined || entry.at >= current.at) folded.set(at, entry)
+  }
+  return [...folded.values()].sort((left, right) => right.at - left.at).slice(0, limit)
+}
+
+/**
+ * Whether a parsed value is a usable entry.
+ */
 function isRecent(value: unknown): value is RecentProject {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
   const entry = value as Record<string, unknown>

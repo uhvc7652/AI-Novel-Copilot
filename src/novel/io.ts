@@ -64,9 +64,9 @@ import {
   PROJECT_FILE,
   chapterPath,
   groupCards,
-  groupVolumes,
   identityOfPath,
   isChapterPath,
+  mergeVolumes,
   nextChapterNumber,
   referenceIndex,
   scaffoldFiles,
@@ -81,6 +81,7 @@ import {
   type ChapterStatus,
   type ChapterSummary,
   type ProjectSnapshot,
+  type VolumeOutline,
 } from './project.ts'
 
 /**
@@ -94,12 +95,29 @@ import {
  */
 const CHECK_IGNORE_FILE = `${MACHINE_DIR}/checks.json`
 
+/**
+ * How one loose document presents itself to the readers that scan it.
+ *
+ * The search corpus needs a title and a label; the project snapshot needs to know
+ * which volumes exist and what the author named them (format §4.11). Both read the
+ * same cached scan, so both facts are derived in one place.
+ */
+interface PageInfo {
+  /** Display title, e.g. `世界观` / `第 2 卷卷纲`. */
+  title: string
+  /** Grouping label, e.g. `设定文档` / `大纲`. */
+  label: string
+  /** Volume number, for a volume outline only. */
+  volume?: number
+  /** The volume's name, from the outline's frontmatter `title`. */
+  volumeTitle?: string
+}
+
 /** An opaque filesystem target as the host seam hands it out. */
 interface FsTarget {
   targetKey: string
   displayPath: string
 }
-
 /** File metadata the host seam reports. */
 interface FsInfo {
   version: string
@@ -657,7 +675,12 @@ export class NovelIo {
   async snapshot(scope: NovelScope): Promise<ProjectSnapshot> {
     const meta = await this.projectMeta(scope)
     const chapters = await this.scanChapters(scope)
-    const volumes = groupVolumes(chapters)
+    // A volume exists when its outline does, not only when it has chapters — so
+    // a volume the author planned ahead (第二卷 whose 卷纲 is written, not yet
+    // written into) is offered everywhere a volume is offered. The pages scan is
+    // the cached one the search corpus already pays for; the extra cost here is
+    // the listing of `outline/volumes`, and only on a cold cache the reads.
+    const volumes = mergeVolumes(chapters, await this.scanVolumeOutlines(scope))
     const live = chapters.filter(chapter => !chapter.archived)
     const retired = chapters.filter(chapter => chapter.archived)
     return {
@@ -850,8 +873,11 @@ export class NovelIo {
    */
   async createChapter(scope: NovelScope, spec: NewChapterSpec): Promise<ChapterSummary> {
     const chapters = await this.scanChapters(scope)
-    const volumes = groupVolumes(chapters)
-    const number = spec.number ?? nextChapterNumber(volumes, spec.volume)
+    const volumes = mergeVolumes(chapters, await this.scanVolumeOutlines(scope))
+    // The number is the **book's** next number, not the volume's: chapter numbers
+    // run continuously across volumes (`project.ts` `nextChapterNumber`), which is
+    // what keeps the id derived from it unique across the whole project.
+    const number = spec.number ?? nextChapterNumber(volumes)
     const path = chapterPath(spec.volume, number)
     if (spec.number !== undefined && (await this.read(scope, path)) !== undefined) {
       throw new NovelError('novel/conflict', `第 ${String(number)} 章已经存在：${path}`)
@@ -1208,11 +1234,17 @@ export class NovelIo {
   }
 
   /**
-   * How one loose document presents itself in a search result.
+   * How one loose document presents itself in a search result — and, for a
+   * volume outline, which volume it belongs to and what the author named it.
+   *
+   * The two facts share one derive function on purpose. The scan cache stores one
+   * value per file path, so scanning the same file twice under two shapes would
+   * make whichever ran last the answer for both readers (see `cache.ts`).
    * @param path - storage-relative path.
+   * @param data - the file's frontmatter.
    * @returns its title and label, or undefined when it is not a loose page.
    */
-  private pageOf(path: string): { title: string, label: string } | undefined {
+  private pageOf(path: string, data: Record<string, unknown>): PageInfo | undefined {
     if (path === WORLD_FILE) return { title: '世界观', label: '设定文档' }
     if (path === TIMELINE_FILE) return { title: '时间线', label: '设定文档' }
     if (path === `${OUTLINE_DIR}/book.md`) return { title: '全书主线', label: '大纲' }
@@ -1220,9 +1252,16 @@ export class NovelIo {
     const prefix = `${OUTLINE_DIR}/volumes/`
     if (!path.startsWith(prefix)) return undefined
     const name = path.slice(prefix.length)
-    if (!name.endsWith('.md')) return undefined
-    const volume = /^v(\d+)\.md$/.exec(name)?.[1]
-    return { title: volume === undefined ? name : `第 ${String(Number(volume))} 卷卷纲`, label: '大纲' }
+    const matched = /^v(\d+)\.md$/.exec(name)
+    if (matched?.[1] === undefined) return undefined
+    const volume = Number(matched[1])
+    const title = stringOf(data.title)
+    return {
+      title: `第 ${String(volume)} 卷卷纲`,
+      label: '大纲',
+      volume,
+      ...(title === undefined ? {} : { volumeTitle: title }),
+    }
   }
 
   /**
@@ -1239,7 +1278,7 @@ export class NovelIo {
    * @param scope - project root and session.
    * @returns one entry per existing page.
    */
-  private async scanPages(scope: NovelScope): Promise<ScannedFile<{ title: string, label: string }>[]> {
+  private async scanPages(scope: NovelScope): Promise<ScannedFile<PageInfo>[]> {
     const requests: ScanRequest[] = [
       { path: WORLD_FILE },
       { path: TIMELINE_FILE },
@@ -1252,8 +1291,27 @@ export class NovelIo {
       'pages',
       this.scanSource(scope),
       requests,
-      ({ path }) => this.pageOf(path) ?? { title: path, label: '设定文档' },
+      ({ path, data }) => this.pageOf(path, data) ?? { title: path, label: '设定文档' },
     )
+  }
+
+  /**
+   * Which volumes exist, from the outline directory alone.
+   *
+   * A volume outline is the only trace a planned-but-unwritten volume leaves, and
+   * its frontmatter `title` is where its name lives (format §4.11). Volumes are
+   * also derived from `chapters/vNN/`; {@link mergeVolumes} is what unites the two.
+   * @param scope - project root and session.
+   * @returns one entry per volume outline that exists.
+   */
+  private async scanVolumeOutlines(scope: NovelScope): Promise<VolumeOutline[]> {
+    const outlines: VolumeOutline[] = []
+    for (const entry of await this.scanPages(scope)) {
+      const { volume, volumeTitle } = entry.value
+      if (volume === undefined) continue
+      outlines.push({ volume, ...(volumeTitle === undefined ? {} : { title: volumeTitle }) })
+    }
+    return outlines
   }
 
   /**
@@ -1444,9 +1502,19 @@ export class NovelIo {
       body: entry.body,
       archived: entry.summary.archived,
     }))
+    const volumes = (await this.scanVolumeOutlines(scope))
+      .map(outline => ({
+        volume: outline.volume,
+        ...(outline.title === undefined ? {} : { title: outline.title }),
+      }))
     try {
       return renderExport(
-        { title: meta.title, ...(meta.genre === undefined ? {} : { genre: meta.genre }), chapters },
+        {
+          title: meta.title,
+          ...(meta.genre === undefined ? {} : { genre: meta.genre }),
+          chapters,
+          volumes,
+        },
         request,
       )
     } catch (error) {

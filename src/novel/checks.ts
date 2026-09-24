@@ -562,49 +562,52 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
     }
   }
 
-  // ── 5. Chapter numbering: duplicates and holes ────────────────────────────
-  const volumes = [...new Set(corpus.chapters.map(chapter => chapter.volume))].sort((a, b) => a - b)
-  for (const volume of volumes) {
-    const items = corpus.chapters
-      .filter(chapter => chapter.volume === volume)
-      .sort((left, right) => left.number - right.number)
-    const byNumber = new Map<number, CheckChapter[]>()
-    for (const chapter of items) {
-      byNumber.set(chapter.number, [...(byNumber.get(chapter.number) ?? []), chapter])
-    }
-    for (const [number, group] of byNumber) {
-      if (group.length < 2) continue
-      const first = group[0] as CheckChapter
-      found.push(issue(
-        'chapter-number',
-        'error',
-        first.path,
-        String(number),
-        `第 ${String(volume)} 卷有两个第 ${String(number)} 章`,
-        '章号决定阅读顺序与「上一章」，重复会让续写锚定到不确定的一章。',
-        group.map(chapter => `${chapter.path} · number: ${String(chapter.number)}`),
-        { chapter: first.path },
-      ))
-    }
-    const highest = items.length === 0 ? 0 : (items.at(-1)?.number ?? 0)
-    for (let number = 1; number <= highest; number += 1) {
-      if (byNumber.has(number)) continue
-      // An archived chapter keeps its number (format §4.6), so a number it holds
-      // is not a hole — only a number nothing holds is. The jump target is the
-      // chapter *after* the hole: there is no file to open for the missing one,
-      // and that is where the author's eye needs to land.
-      const next = items.find(chapter => chapter.number > number)
-      found.push(issue(
-        'chapter-gap',
-        'warn',
-        next?.path ?? (items[0]?.path ?? `chapters/v${String(volume).padStart(2, '0')}`),
-        `v${String(volume)}:${String(number)}`,
-        `第 ${String(volume)} 卷缺第 ${String(number)} 章`,
-        `这一卷从 1 排到 ${String(highest)}，中间没有第 ${String(number)} 章，也没有哪一章存档占着这个号——多半是文件在面板之外被删掉了。`,
-        [`chapters/v${String(volume).padStart(2, '0')}/ · 第 ${String(number)} 章的文件不存在`,
-          `${next === undefined ? '下一章' : `下一章：${next.path}`}`],
-      ))
-    }
+  // ── 5. Chapter numbering: duplicates and holes, across the whole book ─────
+  //
+  // **Book-wide, not per volume.** Chapter numbers run continuously across
+  // volumes (format §3.1): 第二卷第一章 is 第 3 章 when the first two volumes hold
+  // two chapters. Judging each volume's numbers from 1 up — which this rule used
+  // to do — would report every chapter of 第二卷 as a hole, and would miss two
+  // chapters numbered 7 in *different* volumes, which is now a real ambiguity:
+  // the number is what 「第 7 章」 means to the author, to 上一章 and to the
+  // reading order.
+  const ordered = [...corpus.chapters].sort((left, right) => left.number - right.number)
+  const byNumber = new Map<number, CheckChapter[]>()
+  for (const chapter of ordered) {
+    byNumber.set(chapter.number, [...(byNumber.get(chapter.number) ?? []), chapter])
+  }
+  for (const [number, group] of byNumber) {
+    if (group.length < 2) continue
+    const first = group[0] as CheckChapter
+    found.push(issue(
+      'chapter-number',
+      'error',
+      first.path,
+      String(number),
+      `全书有两个第 ${String(number)} 章`,
+      '章号是全书连续的，它决定阅读顺序，也是「上一章」与任务装配的依据；重复会让这两件事落到不确定的一章上。',
+      group.map(chapter => `${chapter.path} · number: ${String(chapter.number)}`),
+      { chapter: first.path },
+    ))
+  }
+  const highest = ordered.length === 0 ? 0 : (ordered.at(-1)?.number ?? 0)
+  for (let number = 1; number <= highest; number += 1) {
+    if (byNumber.has(number)) continue
+    // An archived chapter keeps its number (format §4.6), so a number it holds is
+    // not a hole — only a number nothing holds is. The jump target is the chapter
+    // *after* the hole: there is no file to open for the missing one, and that is
+    // where the author's eye needs to land.
+    const next = ordered.find(chapter => chapter.number > number)
+    found.push(issue(
+      'chapter-gap',
+      'warn',
+      next?.path ?? (ordered[0]?.path ?? 'chapters'),
+      String(number),
+      `全书缺第 ${String(number)} 章`,
+      `章号从 1 连续排到 ${String(highest)}，中间没有第 ${String(number)} 章，也没有哪一章存档占着这个号——多半是文件在面板之外被删掉了。`,
+      [`chapters/**/ · 第 ${String(number)} 章的文件不存在`,
+        `${next === undefined ? '下一章' : `下一章：${next.path}`}`],
+    ))
   }
 
   // ── 6. The id a chapter declares against the id its filename encodes ──────

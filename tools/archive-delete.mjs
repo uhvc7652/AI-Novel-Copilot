@@ -65,13 +65,15 @@ try {
       console.log('      删掉后「检查」会把它们报成断链：章节引用卡是 missing-ref，伏笔字段与时间线是 thread-ref / timeline-ref，firstAppear 是 firstappear-mismatch。')
     }
     // A gap only opens when something still ranks *after* the number being freed:
-    // 1..最高之间没有人占的号才算洞，所以删掉最后一章不会报缺号。
+    // 1..最高之间没有人占的号才算洞，所以删掉最后一章不会报缺号。比较要在**全书**
+    // 范围内做——章号是全书连续的（`03` §3.1），第二卷的章号接着第一卷往下排，
+    // 所以「本卷里后面没有章」不等于「没人占着更大的号」。
     const mine = chapters.find(chapter => chapter.rel === file.rel)
     if (mine !== undefined) {
       const behind = chapters.filter(chapter =>
-        !going.has(chapter.rel) && chapter.volume === mine.volume && chapter.number > mine.number)
+        !going.has(chapter.rel) && chapter.number > mine.number)
       if (behind.length > 0) {
-        console.log(`    ⚠ 第 ${String(mine.volume)} 卷的章号 ${String(mine.number)} 后面还有 ${String(behind.length)} 章`)
+        console.log(`    ⚠ 章号 ${String(mine.number)} 后面还有 ${String(behind.length)} 章（按全书算）`)
         console.log(`      删掉后「检查」会报第 ${String(mine.number)} 章缺号（chapter-gap）——那是它在说这个号没人占了。`)
       }
     }

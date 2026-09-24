@@ -413,11 +413,17 @@ async function cardBlocks(
 }
 
 /**
- * The previous chapter in the same volume, as a chapter of this book.
+ * The chapter before this one in the book.
  *
  * "Previous" means the previous *live* chapter: an archived chapter has been
  * withdrawn from the story, so anchoring continuity on it would have the writer
  * continue from a scene the author has taken out of the book.
+ *
+ * **Whole book, not the same volume.** Chapter numbers run continuously across
+ * volumes (format §3.1), so the highest number below this one is the chapter it
+ * follows — and that is exactly what a volume boundary needs: 第二卷第一章 continues
+ * 第一卷's last chapter, not nothing. (The rule used to look inside the current
+ * volume's chapters, which was right only while numbers restarted per volume.)
  * @param ctx - task context.
  * @param chapter - the chapter being written.
  * @returns the earlier chapter, or undefined when there is none.
@@ -425,8 +431,7 @@ async function cardBlocks(
 function previousLiveChapter(ctx: TaskContext, chapter: LoadedChapter): ChapterSummary | undefined {
   const number = typeof chapter.data.number === 'number' ? chapter.data.number : undefined
   if (number === undefined || number <= 1) return undefined
-  const volume = ctx.volumes.find(item => item.volume === ctx.volume)
-  return volume?.chapters
+  return ctx.volumes.flatMap(volume => volume.chapters)
     .filter(item => !item.archived && item.number < number)
     .sort((left, right) => right.number - left.number)[0]
 }
