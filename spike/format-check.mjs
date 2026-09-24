@@ -96,6 +96,15 @@ check('文档白名单挡住 novel.yaml / .novel / 非 md / 逃逸',
 check('卷纲路径与主线路径固定', volumeOutlinePath(2) === 'outline/volumes/v02.md' && BOOK_OUTLINE_FILE === 'outline/book.md')
 
 console.log('\n--- 章节与反向索引 ---')
+/**
+ * The fixture chapter's prose.
+ *
+ * Its opening sentence sits more than 800 characters above the end, so
+ * 「上一章全文」 and the old 「上一章结尾 800 字」 are **distinguishable** by an
+ * assertion: if the opening arrives, the whole chapter travelled. It also puts
+ * the padding above `雨下了一整夜。`, so every older assertion that looked for the
+ * ending keeps passing.
+ */
 const chapterText = [
   '---',
   'id: c0001',
@@ -113,6 +122,10 @@ const chapterText = [
   'locations: [qingshi-town]',
   '---',
   '',
+  '雪停了，屋檐还在滴水。',
+  '',
+  '铺'.repeat(900),
+  '',
   '雨下了一整夜。',
   '',
 ].join('\n')
@@ -120,6 +133,19 @@ const c1 = summarizeChapter('chapters/v01/c0001.md', chapterText)
 check('章纲从 frontmatter 读出', c1.beats.length === 2 && c1.beats[1] === '被巡夜人撞见，仓皇逃走')
 check('摘要与视角读出', c1.summary === '陈默捡到青铜镜。' && c1.pov === 'chen-mo')
 check('引用列表读出', c1.characters.join() === 'chen-mo,lao-zhou' && c1.locations.join() === 'qingshi-town')
+// 参考章节（`contextChapters`，格式 §3.2）：作者手挂上来的章，写作任务会把它们的
+// **全文**交给模型。与 `characters` / `locations` / `refs` 一样容忍一个裸标量。
+check('参考章节从 frontmatter 读出（手写一个标量也算一个 id）',
+  summarizeChapter('chapters/v01/c0001.md', '---\nnumber: 1\ncontextChapters: [c0005, c0009]\n---\n\n')
+    .contextChapters.join() === 'c0005,c0009'
+  && summarizeChapter('chapters/v01/c0001.md', '---\nnumber: 1\ncontextChapters: c0009\n---\n\n')
+    .contextChapters.join() === 'c0009')
+check('没写 contextChapters 的章是空数组（旧章不加这个字段也安全）', c1.contextChapters.length === 0)
+// 章节 id 与卡 id 是两套空间：把 `chen-mo` 写进 contextChapters 不能让陈默那张卡多出
+// 一次「出场」——反向索引是 `appearsIn` 的唯一来源，混进章节引用就是让卡片撒谎。
+check('参考章节不进卡片的反向索引（章节 id 与卡 id 是两套空间）',
+  referenceIndex([summarizeChapter('chapters/v01/c0005.md', '---\nnumber: 5\ncontextChapters: [chen-mo]\n---\n\n')])
+    .get('chen-mo') === undefined)
 const c2 = summarizeChapter('chapters/v01/c0002.md', '---\nid: c0002\nnumber: 2\ncharacters: chen-mo\n---\n\n')
 const index = referenceIndex([c1, c2])
 check('反向索引把卡映射到章节',
@@ -460,6 +486,8 @@ const checkChapter = (fileId, number, extra = {}) => ({
   characters: [],
   locations: [],
   refs: [],
+  // 参考章节：作者手挂上来的章（格式 §3.2）。默认空，单个用例自己写。
+  contextChapters: [],
   wordCount: 0,
   archived: false,
   // Prose is part of the corpus now: M6's `thread-quote` has to look for a
@@ -490,6 +518,9 @@ const CHECK_CORPUS = {
     checkChapter('c0001', 1, {
       pov: 'chen-mo', characters: ['chen-mo'], locations: ['qingshi-town'],
       targetWords: 3000, wordCount: 1200,
+      // 参考章节的四条边：一条活章（安静）、一条不存在的章（错误）、一条已存档的章
+      // （警告：生成时会跳过它）、以及本章自己（提示）。
+      contextChapters: ['c0005', 'c0999', 'c0001', 'c0002'],
       body: '雨下了一整夜。\n\n他握紧了那半块青铜镜，指节发白。\n',
     }),
     checkChapter('c0002', 2, { archived: true, title: '撤掉的一章', locations: ['old-towner'] }),
@@ -677,6 +708,27 @@ check('引用不存在的卡：一条 issue，两处依据', (() => {
     && found[0].evidence[1].includes('settings/*/qingshi-town.md')
 })())
 check('设定卡的 relations 指向不存在的卡', has('card-ref', 'settings/characters/chen-mo.md', 'ghost'))
+// ── 参考章节（`contextChapters`）：章节引用章节，落在另一套 id 空间里 ─────────
+// 手工写错一个章节 id，写作任务只会安安静静地少带一章正文——所以规则必须说话。
+check('参考章节指向不存在的章：一条错误，两侧依据都在', (() => {
+  const found = findRule('context-ref').filter(issue => issue.severity === 'error')
+  return found.length === 1
+    && found[0].key === 'context-ref:chapters/v01/c0001.md:c0999'
+    && found[0].evidence.length === 2
+    && found[0].evidence[1].includes('c0999')
+})())
+check('参考章节指向已存档的章：警告，并说清生成时会跳过它', (() => {
+  const found = findRule('context-ref').filter(issue => issue.severity === 'warn')
+  return found.length === 1
+    && found[0].key === 'context-ref:chapters/v01/c0001.md:c0002'
+    && found[0].detail.includes('跳过')
+})())
+check('参考章节写成本章自己：提示，不是错误', (() => {
+  const found = findRule('context-ref').filter(issue => issue.severity === 'info')
+  return found.length === 1 && found[0].key === 'context-ref:chapters/v01/c0001.md:c0001'
+})())
+check('参考章节指到活章：不报（规则没有被写成「凡引用皆可疑」）',
+  !findRule('context-ref').some(issue => issue.key.endsWith(':c0005')))
 check('伏笔指向不存在的章节', has('thread-ref', 'settings/threads/fs-005.md', 'c9999'))
 check('时间线指向不存在的章节', has('timeline-ref', 'settings/timeline.md', 'c9999'))
 check('名字/别名撞车：共用别名「默哥」的两张卡各报一条', (() => {
@@ -851,6 +903,13 @@ check('报告如实报告扫描量与分类计数',
   && checkReport.counts.error + checkReport.counts.warn + checkReport.counts.info === checkReport.issues.length)
 
 console.log('\n--- 任务装配（stub fetch） ---')
+/**
+ * A chapter the author attached by hand as 参考章节.
+ *
+ * Its own file, so "the reference travelled" is asserted against the reference
+ * rather than against the previous chapter's text.
+ */
+const contextChapterText = '---\nid: c0007\nvolume: 1\nnumber: 7\ntitle: 第七章 旧债\nsummary: 陈默还了那笔债。\n---\n\n那笔债是三年前欠下的。\n'
 const FILES = {
   'novel.yaml': 'title: 测试之书\n',
   'style/style-guide.md': '# 文风规则\n\n短句为主。\n',
@@ -876,6 +935,7 @@ const FILES = {
     `---\nid: probe-${letter}\nname: 探针${letter}\n---\n\n## 定义\n第 ${letter} 张。\n`,
   ])),
   'chapters/v01/c0001.md': chapterText,
+  'chapters/v01/c0007.md': contextChapterText,
 }
 const requested = []
 globalThis.fetch = async (url) => {
@@ -975,6 +1035,51 @@ check('没有引用卡的章不会被塞进一个空小节',
     chapter: { ...ctx.chapter, data: { number: 2, title: '第二章 巡夜人', targetWords: 3000, beats: ['陈默撞见巡夜人'] } },
   })).prompt.includes('【本章相关设定】'))
 
+// ── 上一章全文 + 参考章节（作者 9/16 的要求） ───────────────────────────────
+// 此前写作任务只有本章自己的材料：续写看本章最后 1500 字，改写/扩写/润色看本章全文，
+// **上一章一个字都没有**（带上一章的只有「按章纲写整章」与模型检查）。作者的要求是
+// 续写与扩写至少要把上一章带上，选定的粒度是「上一章全文 + 摘要」，并且允许自己再挂
+// 几章（`contextChapters`）。四条断言盯住这条线：全文真的全文（开头那一句在 800 字
+// 尾巴之外，只有整章进 prompt 才带得到）、摘要跟着、参考章节整章进、重复的章不出现
+// 两次。
+const c7 = summarizeChapter('chapters/v01/c0007.md', contextChapterText)
+const ctxWithContext = {
+  ...ctx,
+  // 本章自己（c0002）、上一章（c0001）与同一个 id 写两遍（c0007）都在里面：装配时要
+  // 把它们各自跳过（本章正文本来就在 prompt 里，上一章已经作为【上一章】带上了，
+  // 同一个 id 写两遍不该变成两遍正文）。
+  chapter: { ...ctx.chapter, data: { ...ctx.chapter.data, contextChapters: ['c0007', 'c0007', 'c0001', 'c0002'] } },
+  volumes: [{ dir: 'v01', volume: 1, chapters: [c1, c2, c7] }],
+}
+const withStory = []
+for (const task of CHAPTER_TASKS.slice(0, 5)) withStory.push(await assemble(task, ctxWithContext))
+const styleOnly = await assemble(CHAPTER_TASKS[5], ctxWithContext)
+check('整章 / 续写 / 改写 / 扩写 / 润色 都带上上一章，而且是全文加摘要',
+  withStory.every(task => task.prompt.includes('【上一章】第 1 章 楔子·雨夜')
+    && task.prompt.includes('摘要：陈默捡到青铜镜。')
+    && task.prompt.includes('全文：')
+    && task.prompt.includes('雪停了，屋檐还在滴水。')   // 开头那一句：800 字尾巴到不了这里
+    && task.prompt.includes('雨下了一整夜。')))
+check('上一章在输入清单里，理由写明带的是全文（作者数得出来）',
+  withStory.every(task => task.inputs.some(item =>
+    item.path === 'chapters/v01/c0001.md' && item.reason.includes('上一章全文'))))
+check('参考章节：作者挂上来的章整章进 prompt，章号与标题都在',
+  withStory.every(task => task.prompt.includes('【参考章节】第 7 章 第七章 旧债')
+    && task.prompt.includes('那笔债是三年前欠下的。')))
+check('参考章节也在输入清单里，理由指明是哪一章',
+  withStory.every(task => task.inputs.some(item =>
+    item.path === 'chapters/v01/c0007.md' && item.reason.includes('第七章 旧债'))))
+check('同一章不会进两次：本章自己、已经作为【上一章】的章、以及写了两遍的 id 都被跳过',
+  withStory.every(task => (task.prompt.match(/【上一章】/g) ?? []).length === 1
+    && (task.prompt.match(/【参考章节】/g) ?? []).length === 1
+    && !task.prompt.includes('【参考章节】第 1 章')
+    && !task.prompt.includes('【参考章节】第 2 章')))
+check('去 AI 味检查不带章节正文（输入清单说的是模型读了什么，不许说了没读）',
+  styleOnly.prompt.includes('【本章正文】')
+  && !styleOnly.prompt.includes('【上一章】')
+  && !styleOnly.inputs.some(item =>
+    item.path === 'chapters/v01/c0001.md' || item.path === 'chapters/v01/c0007.md'))
+
 const volumeTask = await assemble(OUTLINE_TASKS[0], ctx)
 check('卷纲任务写明落盘目标', volumeTask.target === 'outline/volumes/v01.md' && volumeTask.apply === 'write-document')
 check('卷纲任务读到主线与本卷已写章节',
@@ -1062,6 +1167,11 @@ const modelCheck = await assemble(CHECK_TASKS[0], checkedCtx)
 check('模型检查读到世界观硬约束', modelCheck.prompt.includes('青铜镜出自旧朝，认主之后不可转赠'))
 check('模型检查读到本章设定卡正文与本章正文',
   modelCheck.prompt.includes('沉默。') && modelCheck.prompt.includes('他握紧青铜镜'))
+// 写作任务带上一章全文，模型检查**故意不带**：它判的是这一章，`08` §2.2 明写「不喂
+// 其它章节正文，只给上一章的摘要与结尾」。这条断言把那个区别钉住，免得下次顺手统一。
+check('模型检查仍然只要上一章的摘要与结尾（不喂别的章全文）',
+  modelCheck.prompt.includes('结尾：') && modelCheck.prompt.includes('雨下了一整夜。')
+  && !modelCheck.prompt.includes('雪停了，屋檐还在滴水。'))
 check('模型检查要求逐字引用与依据，并明确不报文风问题',
   modelCheck.prompt.includes('逐字复制') && modelCheck.prompt.includes('不要报错别字'))
 check('模型检查把规则已报的问题列出来让它不要重复',

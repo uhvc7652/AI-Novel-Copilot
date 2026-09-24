@@ -42,6 +42,7 @@ import { ChecksView } from './ChecksView.tsx'
 import { HistoryView } from './HistoryView.tsx'
 import { TaskBar } from './TaskBar.tsx'
 import { ChapterCards } from './ChapterCards.tsx'
+import { ChapterContext } from './ChapterContext.tsx'
 import { CHAPTER_TASKS, CHECK_TASKS, type TaskContext } from './tasks.ts'
 import {
   box,
@@ -112,16 +113,17 @@ function field(data: Record<string, unknown>, key: string): string {
 }
 
 /**
- * Read a chapter's card references out of frontmatter, tolerating a bare scalar.
+ * Read a chapter's reference ids out of frontmatter, tolerating a bare scalar.
  *
  * `characters` / `locations` / `refs` are hand-editable (format §3.2), and a
  * single id written without brackets is legal — the panel must not show "no
- * cards" for a chapter whose file says `refs: jian-xiu-jingjie`.
+ * cards" for a chapter whose file says `refs: jian-xiu-jingjie`. `contextChapters`
+ * is the same shape for chapters, so it reads through the same function.
  * @param data - the chapter's frontmatter.
  * @param key - which reference field.
  * @returns the ids, in the order written.
  */
-function refsOf(data: Record<string, unknown>, key: ChapterRefField): string[] {
+function refsOf(data: Record<string, unknown>, key: ChapterRefField | 'contextChapters'): string[] {
   const value = data[key]
   if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
   return typeof value === 'string' && value.trim() !== '' ? [value.trim()] : []
@@ -1092,6 +1094,46 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
     })
   }, [])
 
+  /**
+   * The chapters this chapter attaches by hand, in the order the file lists them.
+   *
+   * `contextChapters` is the chapter-side twin of the three card fields above,
+   * and it is read the same tolerant way: a hand-written scalar is one id.
+   */
+  const contextChapters = useMemo(
+    () => refsOf(open?.data ?? {}, 'contextChapters'),
+    [open],
+  )
+
+  /**
+   * Attach one chapter to the open chapter as 参考章节.
+   *
+   * The id written is the chapter summary's id — the frontmatter `id` when it has
+   * one — and task assembly resolves it against every chapter, by that id or by
+   * the one the filename encodes, so the two halves cannot disagree about what
+   * the author picked.
+   */
+  const attachContextChapter = useCallback((id: string) => {
+    const chapter = snapshot?.volumes.flatMap(volume => volume.chapters)
+      .find(item => item.id === id)
+    setOpen(previous => {
+      if (previous === undefined) return previous
+      const ids = refsOf(previous.data, 'contextChapters')
+      if (ids.includes(id)) return previous
+      return { ...previous, data: { ...previous.data, contextChapters: [...ids, id] } }
+    })
+    say(`已把「${chapter === undefined ? id : `第 ${String(chapter.number)} 章 ${chapter.title}`}」记为参考章节——生成任务会带上它的全文，保存后落盘`)
+  }, [say, snapshot])
+
+  /** Detach one chapter from the open chapter. */
+  const detachContextChapter = useCallback((id: string) => {
+    setOpen(previous => {
+      if (previous === undefined) return previous
+      const ids = refsOf(previous.data, 'contextChapters').filter(entry => entry !== id)
+      return { ...previous, data: { ...previous.data, contextChapters: ids } }
+    })
+  }, [])
+
   /** Take a generated chapter body into the editor buffer, still unsaved. */
   const onProse = useCallback((text: string, apply: 'append' | 'replace', label: string) => {
     setOpen(previous => {
@@ -1417,6 +1459,16 @@ export function Panel({ sessionId, pickDirectory }: PanelProps) {
               onDetach={detachCard}
               onRefresh={() => { void reloadLibrary() }}
               {...(libraryNote === undefined ? {} : { note: libraryNote })}
+            />
+            {/* The chapters this chapter is written against — the previous one is
+                automatic, and these are the ones only the author knows about. */}
+            <ChapterContext
+              env={env}
+              volumes={snapshot?.volumes ?? []}
+              {...(open === undefined ? {} : { openPath: open.path })}
+              attached={contextChapters}
+              onAttach={attachContextChapter}
+              onDetach={detachContextChapter}
             />
             <TaskBar
               env={env}

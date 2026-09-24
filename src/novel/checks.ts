@@ -52,6 +52,14 @@ export interface CheckChapter {
   locations: string[]
   /** Generic `lore` card ids the chapter is written against. */
   refs: string[]
+  /**
+   * Chapter ids the author attached as writing material (format §3.2).
+   *
+   * Checked against the chapters rather than the cards: these ids live in the
+   * chapter id space, and a dangling one silently costs the generator the text
+   * it was supposed to read.
+   */
+  contextChapters: string[]
   /** Target length, when the outline set one. */
   targetWords?: number
   /** Measured body length. */
@@ -108,6 +116,7 @@ export interface CheckCorpus {
 /** Which invariant a finding is about. */
 export type CheckRule =
   | 'missing-ref'
+  | 'context-ref'
   | 'card-ref'
   | 'thread-ref'
   | 'timeline-ref'
@@ -126,6 +135,7 @@ export type CheckRule =
 /** Human-readable rule names, for the report's group headings. */
 export const RULE_LABELS: Record<CheckRule, string> = {
   'missing-ref': '引用了不存在的设定 id',
+  'context-ref': '参考章节指向不存在的章节',
   'card-ref': '设定卡引用了不存在的卡',
   'thread-ref': '伏笔引用了不存在的章节',
   'timeline-ref': '时间线引用了不存在的章节',
@@ -295,6 +305,55 @@ export function runChecks(corpus: CheckCorpus): CheckIssue[] {
         [`${chapter.path} · ${fields.join('/')}: ${id}`, `settings/*/${id}.md 不存在`],
         { chapter: chapter.path },
       ))
+    }
+  }
+
+  // ── 1b. 参考章节 naming chapters ──────────────────────────────────────────
+  //
+  // Same line as §1 (live chapters only), but the **target** is judged against
+  // every chapter: an id that resolves to nothing is an error, one that resolves
+  // to an archived chapter is a warning — an archived chapter is out of the story
+  // material, so assembly skips it and the id quietly buys nothing — and naming
+  // itself is only pointless, not wrong (the chapter's own prose is in the prompt
+  // either way). Without this rule a hand-written id would simply vanish from the
+  // prompt with nothing said, which is the class of silence the checks exist for.
+  for (const chapter of live) {
+    for (const id of new Set(chapter.contextChapters)) {
+      const target = chapterOf(id)
+      if (target === undefined) {
+        found.push(issue(
+          'context-ref',
+          'error',
+          chapter.path,
+          id,
+          `${chapterLabel(chapter)} 的参考章节指向不存在的章「${id}」`,
+          `这一章的 frontmatter 里写着 contextChapters: ${id}，但工程里没有这一章。写作任务会把参考章节的正文交给模型——这个 id 现在是白写的。`,
+          [`${chapter.path} · contextChapters: ${id}`, `chapters/**/${id}.md 不存在`],
+          { chapter: chapter.path },
+        ))
+      } else if (target.archived) {
+        found.push(issue(
+          'context-ref',
+          'warn',
+          chapter.path,
+          id,
+          `${chapterLabel(chapter)} 参考的「${target.title}」已存档`,
+          `第 ${String(target.number)} 章已经存档，它不再是故事材料，生成时会跳过它；这一章要接着用它的话，先把它恢复出来。`,
+          [`${chapter.path} · contextChapters: ${id}`, `${target.path} · archived: true`],
+          { chapter: chapter.path },
+        ))
+      } else if (target.path === chapter.path) {
+        found.push(issue(
+          'context-ref',
+          'info',
+          chapter.path,
+          id,
+          `${chapterLabel(chapter)} 把自己列成了参考章节`,
+          '本章正文本来就会进 prompt，装配时会跳过这一条；从 contextChapters 里删掉它就行。',
+          [`${chapter.path} · contextChapters: ${id}`],
+          { chapter: chapter.path },
+        ))
+      }
     }
   }
 

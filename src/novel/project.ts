@@ -89,6 +89,20 @@ export interface ChapterSummary {
    */
   refs: string[]
   /**
+   * Ids of the chapters this one is written against (format §3.2).
+   *
+   * The author attaches them by hand in the prose surface (「参考章节」), the way
+   * cards are attached: a chapter whose setup happens three chapters back is
+   * material the generator must see, and "the immediately previous chapter" is
+   * only the default guess at what that is. Every writing task reads the **full
+   * text** of each id, which is why the field is capped by the author's own
+   * judgement and not by the assembler.
+   *
+   * Unlike `refs` this is not part of the scaffold, so an old chapter simply has
+   * no key — the same shape `pov` uses.
+   */
+  contextChapters: string[]
+  /**
    * Whether the author retired this chapter.
    *
    * The panel's "delete" is archive, for the same reason cards archive: the
@@ -297,6 +311,7 @@ export function summarizeParsedChapter(
     characters: stringArrayField(data, 'characters'),
     locations: stringArrayField(data, 'locations'),
     refs: stringArrayField(data, 'refs'),
+    contextChapters: stringArrayField(data, 'contextChapters'),
     archived: data.archived === true,
   }
 }
@@ -308,6 +323,11 @@ export function summarizeParsedChapter(
  * lists its chapters — so this derived view is the only place the reverse
  * direction exists. It is rebuilt on every scan rather than stored, because a
  * stored copy would be a second truth that can disagree with the first.
+ *
+ * `contextChapters` is deliberately **not** indexed here: those ids name
+ * chapters, not cards, and the id spaces are separate — a chapter id that
+ * happens to equal a card id would otherwise make that card claim an appearance
+ * in a chapter that never mentioned it.
  * @param chapters - scanned chapter summaries.
  * @returns card id → chapter ids, in chapter order.
  */

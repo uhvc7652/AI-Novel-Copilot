@@ -24,7 +24,7 @@
  *
  * @module dsh-ai-novel-copilot/client/tasks
  */
-import { BOOK_OUTLINE_FILE, CARD_LABELS, CARD_TYPES, cardPath, volumeOutlinePath, WORLD_FILE } from '../novel/paths.ts'
+import { BOOK_OUTLINE_FILE, CARD_LABELS, CARD_TYPES, cardPath, chapterIdOfPath, volumeOutlinePath, WORLD_FILE } from '../novel/paths.ts'
 import { cardHasField, liveCards, type CardField } from '../novel/cards.ts'
 import type { CardSummary, ChapterSummary, VolumeSummary } from '../novel/project.ts'
 import { RULE_LABELS, type CheckReport } from '../novel/checks.ts'
@@ -413,40 +413,178 @@ async function cardBlocks(
 }
 
 /**
- * The previous chapter in the same volume, with its summary and its ending.
- *
- * A generator that has never seen the previous chapter invents a scene that
- * cannot follow from it: the summary is the cheap continuity anchor, and the
- * tail is what makes the join seamless.
+ * The previous chapter in the same volume, as a chapter of this book.
  *
  * "Previous" means the previous *live* chapter: an archived chapter has been
  * withdrawn from the story, so anchoring continuity on it would have the writer
  * continue from a scene the author has taken out of the book.
  * @param ctx - task context.
  * @param chapter - the chapter being written.
+ * @returns the earlier chapter, or undefined when there is none.
+ */
+function previousLiveChapter(ctx: TaskContext, chapter: LoadedChapter): ChapterSummary | undefined {
+  const number = typeof chapter.data.number === 'number' ? chapter.data.number : undefined
+  if (number === undefined || number <= 1) return undefined
+  const volume = ctx.volumes.find(item => item.volume === ctx.volume)
+  return volume?.chapters
+    .filter(item => !item.archived && item.number < number)
+    .sort((left, right) => right.number - left.number)[0]
+}
+
+/** How much of a chapter's ending travels when the whole chapter must not. */
+const PREVIOUS_TAIL = 800
+
+/**
+ * One chapter as prompt material: which chapter it is, its summary, and its prose.
+ *
+ * The summary leads because it is the author's own one-line account of the
+ * chapter — the cheapest continuity anchor there is — and the prose follows
+ * because a generator that has only read a summary invents a scene that cannot
+ * follow from the real one.
+ *
+ * `full` decides how much prose travels. The writing tasks take all of it
+ * (「上一章全文」, the author's requirement): the point of the material is that the
+ * model can follow what actually happened, and a tail is a guess about which part
+ * of the chapter the new one continues from. The consistency check deliberately
+ * keeps the tail — it judges *this* chapter, and `docs/08` §2.2 says it reads no
+ * other chapter's prose in full.
+ * @param ctx - task context.
+ * @param target - the chapter to render.
+ * @param label - prompt section name (`上一章` / `参考章节`).
+ * @param reason - how the input list explains the read.
  * @param inputs - assembly list to record into.
+ * @param options - `full` for the whole body, otherwise the final excerpt.
+ * @returns the rendered block.
+ */
+async function chapterBlock(
+  ctx: TaskContext,
+  target: ChapterSummary,
+  label: string,
+  reason: string,
+  inputs: TaskInput[],
+  options: { full: boolean },
+): Promise<string> {
+  const lines = [`【${label}】第 ${String(target.number)} 章 ${target.title}`]
+  if (target.summary !== '') lines.push(`摘要：${target.summary}`)
+  const text = await api.readText(ctx.sessionId, ctx.root, target.path)
+  if (text !== undefined && text.trim() !== '') {
+    inputs.push({ path: target.path, reason })
+    const body = bodyOnly(text).trim()
+    lines.push(options.full ? `全文：\n${body}` : `结尾：\n${tail(body, PREVIOUS_TAIL)}`)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * The previous chapter: 摘要 plus its prose.
+ *
+ * A generator that has never seen the previous chapter invents a scene that
+ * cannot follow from it, so this block is the continuity anchor every writing
+ * task carries — and the 800-character tail the consistency check uses is enough
+ * for judging a join, while a chapter being *written* from it needs the chapter.
+ * @param ctx - task context.
+ * @param chapter - the chapter being written.
+ * @param inputs - assembly list to record into.
+ * @param full - whether the whole body travels (writing tasks) or only its end.
  * @returns the rendered block, or undefined when there is no earlier chapter.
  */
 async function previousChapterBlock(
   ctx: TaskContext,
   chapter: LoadedChapter,
   inputs: TaskInput[],
+  full = false,
 ): Promise<string | undefined> {
-  const number = typeof chapter.data.number === 'number' ? chapter.data.number : undefined
-  if (number === undefined || number <= 1) return undefined
-  const volume = ctx.volumes.find(item => item.volume === ctx.volume)
-  const previous: ChapterSummary | undefined = volume?.chapters
-    .filter(item => !item.archived && item.number < number)
-    .sort((left, right) => right.number - left.number)[0]
+  const previous = previousLiveChapter(ctx, chapter)
   if (previous === undefined) return undefined
-  const lines = [`【上一章】第 ${String(previous.number)} 章 ${previous.title}`]
-  if (previous.summary !== '') lines.push(`摘要：${previous.summary}`)
-  const text = await api.readText(ctx.sessionId, ctx.root, previous.path)
-  if (text !== undefined && text.trim() !== '') {
-    inputs.push({ path: previous.path, reason: '上一章结尾（衔接用）' })
-    lines.push(`结尾：\n${tail(bodyOnly(text), 800)}`)
+  return await chapterBlock(
+    ctx,
+    previous,
+    '上一章',
+    full ? '上一章全文（衔接用）' : '上一章结尾（衔接用）',
+    inputs,
+    { full },
+  )
+}
+
+/**
+ * 参考章节：the chapters the author attached to this one by hand.
+ *
+ * `contextChapters` is the answer to "this chapter is a continuation of chapter
+ * 7, not of the one right before it" — the immediately previous chapter is only
+ * the default guess at what a chapter continues from. Like the card references,
+ * these are the author's decision, so **all** of them travel, in full, in the
+ * order they were written; and like the card references, one that resolves to
+ * nothing is reported by the checks rather than invented here.
+ *
+ * Two things are skipped rather than fed twice: the chapter's own id (its prose
+ * is already in the prompt) and a chapter that is already in the prompt as
+ * 上一章 — the same file twice is tokens the author pays for and learns nothing
+ * from.
+ * @param ctx - task context.
+ * @param chapter - the chapter being written.
+ * @param inputs - assembly list to record into.
+ * @param already - paths already assembled into this prompt.
+ * @returns the rendered blocks, in the order the ids were written.
+ */
+async function contextChapterBlocks(
+  ctx: TaskContext,
+  chapter: LoadedChapter,
+  inputs: TaskInput[],
+  already: readonly string[],
+): Promise<string[]> {
+  // Resolution mirrors the checks layer's: the filename-derived id and the
+  // declared one both name a chapter (`checks.ts` `chapterOf`), because a
+  // hand-written reference must not be dropped here and reported nowhere.
+  const chapters = ctx.volumes.flatMap(volume => volume.chapters)
+  const blocks: string[] = []
+  // Deduplicated by **path**, not by id: two ids can name one chapter (a file id
+  // and the id its frontmatter declares), and feeding that chapter twice is
+  // exactly the waste the `already` list exists to prevent.
+  const added = new Set<string>(already)
+  for (const id of listField(chapter.data, 'contextChapters')) {
+    const target = chapters.find(item =>
+      (item.id === id || chapterIdOfPath(item.path) === id)
+      && !item.archived
+      && item.path !== chapter.path
+      && !added.has(item.path))
+    if (target === undefined) continue
+    added.add(target.path)
+    blocks.push(await chapterBlock(
+      ctx,
+      target,
+      '参考章节',
+      `参考章节：第 ${String(target.number)} 章 ${target.title}`,
+      inputs,
+      { full: true },
+    ))
   }
-  return lines.join('\n')
+  return blocks
+}
+
+/**
+ * The story material around the open chapter: 上一章, then 参考章节.
+ *
+ * One function so the five prose tasks cannot disagree about it — the same
+ * reason `assembleCommon` renders the cards in one place. It is deliberately
+ * *not* part of `assembleCommon`: the 去 AI 味检查 is about voice, and its input
+ * list must not name files its prompt does not contain.
+ * @param ctx - task context.
+ * @param chapter - the chapter being written.
+ * @param inputs - assembly list to record into.
+ * @returns the blocks, in prompt order.
+ */
+async function storyChapters(
+  ctx: TaskContext,
+  chapter: LoadedChapter,
+  inputs: TaskInput[],
+): Promise<string[]> {
+  const previous = previousLiveChapter(ctx, chapter)
+  const blocks: string[] = []
+  if (previous !== undefined) {
+    blocks.push(await chapterBlock(ctx, previous, '上一章', '上一章全文（衔接用）', inputs, { full: true }))
+  }
+  blocks.push(...await contextChapterBlocks(ctx, chapter, inputs, previous === undefined ? [] : [previous.path]))
+  return blocks
 }
 
 /** 续写：continue the chapter from where it stops. */
@@ -461,6 +599,8 @@ const continueTask: TaskDefinition = {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
     const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
+    // 上一章全文 + 参考章节：续写要接着的东西不一定是本章已写的那几句。
+    const story = await storyChapters(ctx, chapter, inputs)
     const body = chapter.body.trim()
     const written = tail(body, 1500)
     // Say which it is: a short chapter goes in whole, and calling a four-word
@@ -472,6 +612,7 @@ const continueTask: TaskDefinition = {
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
       settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
+      ...story,
       written === ''
         ? '【已写正文】（本章尚无正文，请从头写起）'
         : truncated ? `【已写正文（结尾部分）】\n${written}` : `【已写正文】\n${written}`,
@@ -493,12 +634,14 @@ const rewriteTask: TaskDefinition = {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
     const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
+    const story = await storyChapters(ctx, chapter, inputs)
     const target = targetOf(chapter)
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
       settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
+      ...story,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -523,12 +666,14 @@ const expandTask: TaskDefinition = {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
     const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
+    const story = await storyChapters(ctx, chapter, inputs)
     const target = targetOf(chapter) ?? Math.max(1000, countWords(chapter.body))
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
       settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
+      ...story,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -562,12 +707,14 @@ const polishTask: TaskDefinition = {
     const chapter = requireChapter(ctx)
     const inputs: TaskInput[] = []
     const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
+    const story = await storyChapters(ctx, chapter, inputs)
     const target = targetOf(chapter)
     const prompt = [
       header,
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则与样本】\n${voice.trim()}`,
       settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
+      ...story,
       `【当前正文】\n${chapter.body.trim()}`,
       [
         '【要求】',
@@ -660,9 +807,10 @@ const styleCheckTask: TaskDefinition = {
  * 按章纲生成整章：write the whole chapter from its beats.
  *
  * This is requirement §5's example assembly, in full: the book line, the volume
- * outline, the chapter's beats, the cards of the characters it names, and the
- * previous chapter's summary and ending. Everything the model is told comes from
- * a file the author can see in the input list.
+ * outline, the chapter's beats, the cards of the characters it names, the
+ * previous chapter whole, and the chapters the author attached as 参考章节.
+ * Everything the model is told comes from a file the author can see in the input
+ * list.
  */
 const wholeChapterTask: TaskDefinition = {
   id: 'whole-chapter',
@@ -677,7 +825,7 @@ const wholeChapterTask: TaskDefinition = {
     const { header, voice, volume, settings } = await assembleCommon(ctx, inputs)
     const book = await include(ctx, BOOK_OUTLINE_FILE, '全书主线', inputs) ?? ''
     const beats = beatsOf(chapter)
-    const previous = await previousChapterBlock(ctx, chapter, inputs)
+    const story = await storyChapters(ctx, chapter, inputs)
     const target = targetOf(chapter) ?? 3000
     const existing = chapter.body.trim()
     const prompt = [
@@ -686,13 +834,13 @@ const wholeChapterTask: TaskDefinition = {
       volume.trim() === '' ? '' : `【本卷目标】\n${volume.trim()}`,
       voice.trim() === '' ? '' : `【文风规则】\n${voice.trim()}`,
       settings.trim() === '' ? '' : `【本章相关设定】\n${settings.trim()}`,
-      previous ?? '',
+      ...story,
       existing === '' ? '' : `【已有正文（未完成，请在此基础上写完整章）】\n${tail(existing, 2000)}`,
       [
         '【要求】',
         ...OUTPUT_RULES,
         beats.length === 0
-          ? '- 本章还没有章纲：顺着本卷目标与上一章结尾推进，不新增未铺垫的重大设定或人物。'
+          ? '- 本章还没有章纲：顺着本卷目标与上一章推进，不新增未铺垫的重大设定或人物。'
           : '- 严格按【本章要点】的顺序写完整一章，每一条都要落到正文里。',
         `- 目标篇幅约 ${String(target)} 字。`,
         '- 用叙事与对话推进，不要分节标题、不要提纲式罗列。',

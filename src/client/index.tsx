@@ -31,6 +31,7 @@ import { ThreadsView } from './ThreadsView.tsx'
 import { TimelineEditor } from './TimelineEditor.tsx'
 import { ListField } from './ListField.tsx'
 import { ChapterCards } from './ChapterCards.tsx'
+import { ChapterContext } from './ChapterContext.tsx'
 
 /**
  * The view components, exported for `spike/client-load-check.mjs`.
@@ -42,7 +43,7 @@ import { ChapterCards } from './ChapterCards.tsx'
  * that can render each surface with real fixtures is the cheap half of that
  * lesson; the interactive half still needs the author's browser.
  */
-export const __views = { Panel, SettingsView, OutlineView, TaskBar, SearchView, ChecksView, HistoryView, ThreadsView, ModelIssueList, ExportView, TimelineEditor, ListField, ChapterCards }
+export const __views = { Panel, SettingsView, OutlineView, TaskBar, SearchView, ChecksView, HistoryView, ThreadsView, ModelIssueList, ExportView, TimelineEditor, ListField, ChapterCards, ChapterContext }
 
 /** This implementation's identity in the tab system, and the key its body registers under. */
 const NOVEL_ID = 'dsh-ai-novel-copilot'

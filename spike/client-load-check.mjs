@@ -416,6 +416,29 @@ function checkSurfaces(face, react, render) {
       },
       ['＋ 加卡…', '方衡（已引用）', '陈默', '境界-凌空', '设定库 3 张', '刷新', '本章引用的卡', '· 1 张', '生成时会全部带上（1 张）', '!老周'],
     ],
+    [
+      // 「参考章节」：作者手挂上来的章会**整章**进 prompt，所以这一行必须列全、
+      // 数得清，而且要说清「上一章已经自动带上」——否则作者会以为上一章没进
+      // prompt，再手挂一次。本章自己与已存档的章都不出现在可选列表里。
+      'ChapterContext',
+      {
+        env,
+        volumes: [{
+          dir: 'v01',
+          volume: 1,
+          chapters: [
+            chapter,
+            { ...chapter, path: 'chapters/v01/c0002.md', id: 'c0002', number: 2, title: '第二章 巡夜人' },
+            { ...chapter, path: 'chapters/v01/c0003.md', id: 'c0003', number: 3, title: '第三章 撤掉的', archived: true },
+          ],
+        }],
+        openPath: chapter.path,
+        attached: ['c0002'],
+        onAttach: () => {},
+        onDetach: () => {},
+      },
+      ['参考章节', '＋ 加章节…', '第 1 卷', '第二章 巡夜人（已引用）', '可选的章 1 章', '生成时会带上它们的全文（1 章）', '!楔子·雨夜', '!第三章 撤掉的'],
+    ],
     ['OutlineView', { env, snapshot, cards: library.groups[0].cards, active: true, onOpenChapter: () => {}, onChanged: async () => {}, onOpenDocument: () => {} }, ['本卷卷纲', '续写卷纲', '按卷纲拆章', '楔子·雨夜', '要点 2']],
     [
       'SearchView',

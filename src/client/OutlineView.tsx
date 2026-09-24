@@ -534,6 +534,15 @@ export function OutlineView({ env, snapshot, cards, onOpenChapter, onChanged, ac
               title="这一章要依据的世界设定卡（settings/lore/：境界阶梯、体系规则…）"
               onChange={ids => { patchChapter({ refs: ids }) }}
             />
+            {/* 参考章节：写作任务会把这几章的**全文**交给模型（上一章自动带上），
+                与正文页那一行是同一份数据的两个视图。 */}
+            <ListField
+              style={{ ...input, flex: '1 1 120px' }}
+              value={listOf(chapter.data, 'contextChapters')}
+              placeholder="参考章节 id（逗号分隔）"
+              title="这几章的全文会随写作任务进 prompt（上一章不用写，它自动带上）"
+              onChange={ids => { patchChapter({ contextChapters: ids }) }}
+            />
           </div>
           <input
             style={input}

@@ -1312,6 +1312,7 @@ export class NovelIo {
         characters: summary.characters,
         locations: summary.locations,
         refs: summary.refs,
+        contextChapters: summary.contextChapters,
         ...(targetWords === undefined ? {} : { targetWords }),
         wordCount: summary.wordCount,
         archived: summary.archived,
